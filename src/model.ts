@@ -2,80 +2,142 @@ import {
   aabbOf,
   orientedRect,
   polygonInsideRect,
+  rotatePoint,
   type PointMm,
   type Polygon,
   type RectMm,
 } from './geometry'
 
-export const ROOM_WIDTH_MM = 6000
-export const ROOM_HEIGHT_MM = 4500
 export const GRID_MM = 300
+export const MAX_INSTANCES = 12
+export const ROOM_WIDTH_MIN_MM = 3000
+export const ROOM_WIDTH_MAX_MM = 12000
+export const ROOM_DEPTH_MIN_MM = 3000
+export const ROOM_DEPTH_MAX_MM = 12000
+export const ROOM_HEIGHT_MIN_MM = 2400
+export const ROOM_HEIGHT_MAX_MM = 4500
+export const DIMENSION_STEP_MM = 100
+export const ZONE_SIZE_MIN_MM = 1200
 
-export type FurnitureId = 'sofa' | 'chair' | 'coffee' | 'side'
+export type FurnitureTypeId = 'sofa' | 'chair' | 'coffee' | 'side'
 export type Rotation = 0 | 45 | 90 | 135 | 180 | 225 | 270 | 315
 export type Mode = 'guided' | 'variants'
 
 export type { PointMm, RectMm }
 
-export type FurnitureDef = {
-  id: FurnitureId
-  label: string
-  w: number
-  h: number
-  clearance: number
+export type ClearanceMm = {
+  front: number
+  back: number
+  left: number
+  right: number
 }
 
-/** Scene-space transform. x/y are the furniture centre in millimetres. */
-export type PlacedItem = {
-  id: FurnitureId
-  x: number
-  y: number
-  rotation: Rotation
+export type FurnitureDefinition = {
+  typeId: FurnitureTypeId
+  name: string
+  widthMm: number
+  depthMm: number
+  heightMm: number
+  clearanceMm: ClearanceMm
+  allowedVariantRotations: Rotation[]
+}
+
+export type FurnitureInstance = {
+  id: string
+  typeId: FurnitureTypeId
+  xMm: number
+  yMm: number
+  rotationDeg: Rotation
   locked: boolean
+  includedInVariants: boolean
+}
+
+export type RoomSettings = {
+  widthMm: number
+  depthMm: number
+  heightMm: number
 }
 
 export const ROTATIONS: Rotation[] = [0, 45, 90, 135, 180, 225, 270, 315]
+export const CARDINAL_ROTATIONS: Rotation[] = [0, 90, 180, 270]
 
-export const LOUNGE_ZONE: RectMm = {
+export const DEFAULT_ROOM: RoomSettings = {
+  widthMm: 6000,
+  depthMm: 4500,
+  heightMm: 2800,
+}
+
+export const DEFAULT_ZONE: RectMm = {
   x: 600,
   y: 600,
   w: 3600,
   h: 2700,
 }
 
-export const ROOM_RECT: RectMm = {
-  x: 0,
-  y: 0,
-  w: ROOM_WIDTH_MM,
-  h: ROOM_HEIGHT_MM,
+function uniformClearance(mm: number): ClearanceMm {
+  return { front: mm, back: mm, left: mm, right: mm }
 }
 
-export const FURNITURE: readonly FurnitureDef[] = [
-  { id: 'sofa', label: 'Sofa', w: 2200, h: 900, clearance: 300 },
-  { id: 'chair', label: 'Lounge chair', w: 900, h: 900, clearance: 300 },
-  { id: 'coffee', label: 'Coffee table', w: 1200, h: 600, clearance: 400 },
-  { id: 'side', label: 'Side table', w: 500, h: 500, clearance: 200 },
+export const FURNITURE_DEFINITIONS: readonly FurnitureDefinition[] = [
+  {
+    typeId: 'sofa',
+    name: 'Sofa',
+    widthMm: 2200,
+    depthMm: 900,
+    heightMm: 850,
+    clearanceMm: uniformClearance(300),
+    allowedVariantRotations: CARDINAL_ROTATIONS,
+  },
+  {
+    typeId: 'chair',
+    name: 'Lounge chair',
+    widthMm: 900,
+    depthMm: 900,
+    heightMm: 880,
+    clearanceMm: uniformClearance(300),
+    allowedVariantRotations: ROTATIONS,
+  },
+  {
+    typeId: 'coffee',
+    name: 'Coffee table',
+    widthMm: 1200,
+    depthMm: 600,
+    heightMm: 420,
+    clearanceMm: uniformClearance(400),
+    allowedVariantRotations: CARDINAL_ROTATIONS,
+  },
+  {
+    typeId: 'side',
+    name: 'Side table',
+    widthMm: 500,
+    depthMm: 500,
+    heightMm: 560,
+    clearanceMm: uniformClearance(200),
+    allowedVariantRotations: CARDINAL_ROTATIONS,
+  },
 ] as const
 
-export const FURNITURE_BY_ID: Record<FurnitureId, FurnitureDef> = {
-  sofa: FURNITURE[0],
-  chair: FURNITURE[1],
-  coffee: FURNITURE[2],
-  side: FURNITURE[3],
+export const FURNITURE_BY_TYPE: Record<FurnitureTypeId, FurnitureDefinition> = {
+  sofa: FURNITURE_DEFINITIONS[0],
+  chair: FURNITURE_DEFINITIONS[1],
+  coffee: FURNITURE_DEFINITIONS[2],
+  side: FURNITURE_DEFINITIONS[3],
 }
 
-export const ALL_IDS: FurnitureId[] = FURNITURE.map((item) => item.id)
+export const FURNITURE_TYPE_IDS: FurnitureTypeId[] = FURNITURE_DEFINITIONS.map((item) => item.typeId)
 
-/** Unrotated local origin of the initial staging (centre is derived from this). */
-export const INITIAL_ORIGINS: Record<FurnitureId, PointMm> = {
-  sofa: { x: 900, y: 900 },
-  chair: { x: 3300, y: 900 },
-  coffee: { x: 1500, y: 2100 },
-  side: { x: 3300, y: 2100 },
+export function definitionOf(typeId: string): FurnitureDefinition {
+  const found = FURNITURE_BY_TYPE[typeId as FurnitureTypeId]
+  if (!found) throw new Error(`Unknown furniture type: ${typeId}`)
+  return found
 }
 
-export function formatMmSize(item: FurnitureDef): string {
-  return `${item.w} × ${item.h} mm`
+export function formatMmSize(def: FurnitureDefinition): string {
+  return `${def.widthMm} × ${def.depthMm} mm`
+}
+
+export function formatMmVolume(def: FurnitureDefinition): string {
+  return `${def.widthMm} × ${def.depthMm} × ${def.heightMm} mm`
 }
 
 export function mmToPercent(mm: number, total: number): string {
@@ -87,41 +149,72 @@ export function asRotation(value: number): Rotation {
   return (Math.round(wrapped / 45) * 45) % 360 as Rotation
 }
 
-export function nextRotation(rotation: Rotation): Rotation {
-  return asRotation(rotation + 45)
+export function nextRotation(rotation: Rotation, step = 45): Rotation {
+  return asRotation(rotation + step)
 }
 
-export function centerOf(item: PlacedItem): PointMm {
-  return { x: item.x, y: item.y }
+export function previousRotation(rotation: Rotation): Rotation {
+  return asRotation(rotation - 45)
 }
 
-export function footprintPolygon(item: PlacedItem, def = FURNITURE_BY_ID[item.id]): Polygon {
-  return orientedRect({ x: item.x, y: item.y }, def.w, def.h, item.rotation)
+export function centerOf(item: FurnitureInstance): PointMm {
+  return { x: item.xMm, y: item.yMm }
 }
 
-export function clearancePolygon(item: PlacedItem, def = FURNITURE_BY_ID[item.id]): Polygon {
-  return orientedRect(
-    { x: item.x, y: item.y },
-    def.w + def.clearance * 2,
-    def.h + def.clearance * 2,
-    item.rotation,
-  )
+export function roomRect(room: RoomSettings): RectMm {
+  return { x: 0, y: 0, w: room.widthMm, h: room.depthMm }
 }
 
-export function footprintOf(item: PlacedItem, def = FURNITURE_BY_ID[item.id]): RectMm {
+export function clampDimension(value: number, min: number, max: number, step = DIMENSION_STEP_MM): number {
+  const rounded = Math.round(value / step) * step
+  return Math.min(max, Math.max(min, rounded))
+}
+
+export function centerZoneInRoom(room: RoomSettings, widthMm: number, depthMm: number): RectMm {
+  const w = Math.min(room.widthMm, Math.max(ZONE_SIZE_MIN_MM, widthMm))
+  const h = Math.min(room.depthMm, Math.max(ZONE_SIZE_MIN_MM, depthMm))
+  return {
+    x: (room.widthMm - w) / 2,
+    y: (room.depthMm - h) / 2,
+    w,
+    h,
+  }
+}
+
+export function keepZoneInsideRoom(room: RoomSettings, zone: RectMm): RectMm {
+  const w = Math.min(zone.w, room.widthMm)
+  const h = Math.min(zone.h, room.depthMm)
+  const x = Math.min(Math.max(0, zone.x), room.widthMm - w)
+  const y = Math.min(Math.max(0, zone.y), room.depthMm - h)
+  return { x, y, w, h }
+}
+
+export function footprintPolygon(item: FurnitureInstance, def = definitionOf(item.typeId)): Polygon {
+  return orientedRect({ x: item.xMm, y: item.yMm }, def.widthMm, def.depthMm, item.rotationDeg)
+}
+
+export function clearancePolygon(item: FurnitureInstance, def = definitionOf(item.typeId)): Polygon {
+  const { front, back, left, right } = def.clearanceMm
+  const halfW = def.widthMm / 2
+  const halfD = def.depthMm / 2
+  const local = [
+    { x: -halfW - left, y: -halfD - back },
+    { x: halfW + right, y: -halfD - back },
+    { x: halfW + right, y: halfD + front },
+    { x: -halfW - left, y: halfD + front },
+  ]
+  return local.map((point) => {
+    const rotated = rotatePoint(point, item.rotationDeg)
+    return { x: item.xMm + rotated.x, y: item.yMm + rotated.y }
+  })
+}
+
+export function footprintOf(item: FurnitureInstance, def = definitionOf(item.typeId)): RectMm {
   return aabbOf(footprintPolygon(item, def))
 }
 
-export function clearanceOf(item: PlacedItem, def = FURNITURE_BY_ID[item.id]): RectMm {
-  return aabbOf(clearancePolygon(item, def))
-}
-
-export function rotatedSize(def: FurnitureDef, rotation: Rotation): { w: number; h: number } {
-  return aabbOf(orientedRect({ x: 0, y: 0 }, def.w, def.h, rotation))
-}
-
-export function rotateAroundCenter(item: PlacedItem, rotation: Rotation): PlacedItem {
-  return { ...item, rotation }
+export function clearanceBudget(def: FurnitureDefinition): number {
+  return Math.max(def.clearanceMm.front, def.clearanceMm.back, def.clearanceMm.left, def.clearanceMm.right)
 }
 
 export function facingVector(rotation: Rotation): PointMm {
@@ -155,69 +248,88 @@ export function orientationAxis(rotation: Rotation): number {
   return rotation % 180
 }
 
-export function clampItemToRoom(item: PlacedItem): PlacedItem {
+export function clampItemToRoom(item: FurnitureInstance, room: RoomSettings): FurnitureInstance {
+  const bounds = roomRect(room)
   const box = footprintOf(item)
   let dx = 0
   let dy = 0
-  if (box.x < ROOM_RECT.x) dx += ROOM_RECT.x - box.x
-  if (box.x + box.w + dx > ROOM_RECT.x + ROOM_RECT.w) {
-    dx = ROOM_RECT.x + ROOM_RECT.w - box.x - box.w
+  if (box.x < bounds.x) dx += bounds.x - box.x
+  if (box.x + box.w + dx > bounds.x + bounds.w) {
+    dx = bounds.x + bounds.w - box.x - box.w
   }
-  if (box.y < ROOM_RECT.y) dy += ROOM_RECT.y - box.y
-  if (box.y + box.h + dy > ROOM_RECT.y + ROOM_RECT.h) {
-    dy = ROOM_RECT.y + ROOM_RECT.h - box.y - box.h
+  if (box.y < bounds.y) dy += bounds.y - box.y
+  if (box.y + box.h + dy > bounds.y + bounds.h) {
+    dy = bounds.y + bounds.h - box.y - box.h
   }
   if (dx === 0 && dy === 0) return item
-  return { ...item, x: item.x + dx, y: item.y + dy }
+  return { ...item, xMm: item.xMm + dx, yMm: item.yMm + dy }
 }
 
-export function itemFitsRoom(item: PlacedItem): boolean {
-  return polygonInsideRect(footprintPolygon(item), ROOM_RECT)
+export function itemFitsRoom(item: FurnitureInstance, room: RoomSettings): boolean {
+  return polygonInsideRect(footprintPolygon(item), roomRect(room))
 }
 
-export function positionKey(items: readonly PlacedItem[]): string {
+export function layoutSignature(items: readonly FurnitureInstance[]): string {
   return [...items]
     .sort((a, b) => a.id.localeCompare(b.id))
-    .map((item) => `${item.id}:${Math.round(item.x)}:${Math.round(item.y)}`)
+    .map(
+      (item) =>
+        `${item.id}:${item.typeId}:${Math.round(item.xMm)}:${Math.round(item.yMm)}:${item.rotationDeg}:${item.includedInVariants ? 1 : 0}`,
+    )
     .join('|')
 }
 
-export function layoutSignature(items: readonly PlacedItem[]): string {
-  return [...items]
-    .sort((a, b) => a.id.localeCompare(b.id))
-    .map((item) => `${item.id}:${Math.round(item.x)}:${Math.round(item.y)}:${item.rotation}`)
-    .join('|')
+export function instanceLabel(item: FurnitureInstance, all: readonly FurnitureInstance[]): string {
+  const def = definitionOf(item.typeId)
+  const same = all.filter((entry) => entry.typeId === item.typeId)
+  if (same.length <= 1) return def.name
+  const index = same.findIndex((entry) => entry.id === item.id) + 1
+  return `${def.name} ${index}`
 }
 
-export function createInitialItems(): Record<FurnitureId, PlacedItem> {
-  return {
-    sofa: {
-      id: 'sofa',
-      x: INITIAL_ORIGINS.sofa.x + FURNITURE_BY_ID.sofa.w / 2,
-      y: INITIAL_ORIGINS.sofa.y + FURNITURE_BY_ID.sofa.h / 2,
-      rotation: 0,
+export function createInitialInstances(): FurnitureInstance[] {
+  const sofa = FURNITURE_BY_TYPE.sofa
+  const chair = FURNITURE_BY_TYPE.chair
+  const coffee = FURNITURE_BY_TYPE.coffee
+  const side = FURNITURE_BY_TYPE.side
+  return [
+    {
+      id: 'sofa-1',
+      typeId: 'sofa',
+      xMm: 900 + sofa.widthMm / 2,
+      yMm: 900 + sofa.depthMm / 2,
+      rotationDeg: 0,
       locked: false,
+      includedInVariants: true,
     },
-    chair: {
-      id: 'chair',
-      x: INITIAL_ORIGINS.chair.x + FURNITURE_BY_ID.chair.w / 2,
-      y: INITIAL_ORIGINS.chair.y + FURNITURE_BY_ID.chair.h / 2,
-      rotation: 0,
+    {
+      id: 'chair-1',
+      typeId: 'chair',
+      xMm: 3300 + chair.widthMm / 2,
+      yMm: 900 + chair.depthMm / 2,
+      rotationDeg: 0,
       locked: false,
+      includedInVariants: true,
     },
-    coffee: {
-      id: 'coffee',
-      x: INITIAL_ORIGINS.coffee.x + FURNITURE_BY_ID.coffee.w / 2,
-      y: INITIAL_ORIGINS.coffee.y + FURNITURE_BY_ID.coffee.h / 2,
-      rotation: 0,
+    {
+      id: 'coffee-1',
+      typeId: 'coffee',
+      xMm: 1500 + coffee.widthMm / 2,
+      yMm: 2100 + coffee.depthMm / 2,
+      rotationDeg: 0,
       locked: false,
+      includedInVariants: true,
     },
-    side: {
-      id: 'side',
-      x: INITIAL_ORIGINS.side.x + FURNITURE_BY_ID.side.w / 2,
-      y: INITIAL_ORIGINS.side.y + FURNITURE_BY_ID.side.h / 2,
-      rotation: 0,
+    {
+      id: 'side-1',
+      typeId: 'side',
+      xMm: 3300 + side.widthMm / 2,
+      yMm: 2100 + side.depthMm / 2,
+      rotationDeg: 0,
       locked: false,
+      includedInVariants: true,
     },
-  }
+  ]
 }
+
+export const INITIAL_INSTANCE_SEQ = 5

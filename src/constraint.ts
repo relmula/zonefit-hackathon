@@ -1,10 +1,10 @@
 import { polygonInsideRect, polygonIntersectsRect, polygonsOverlap } from './geometry'
 import {
-  FURNITURE_BY_ID,
-  LOUNGE_ZONE,
   clearancePolygon,
+  definitionOf,
   footprintPolygon,
-  type PlacedItem,
+  type FurnitureInstance,
+  type RectMm,
 } from './model'
 
 export type ZoneRelation = 'outside' | 'partial' | 'inside'
@@ -29,16 +29,16 @@ function firstReason(issues: ConstraintIssue[], fallback: string): string {
   return issues[0]?.reason ?? fallback
 }
 
-export function zoneRelation(item: PlacedItem): ZoneRelation {
+export function zoneRelation(item: FurnitureInstance, zone: RectMm): ZoneRelation {
   const footprint = footprintPolygon(item)
-  if (polygonInsideRect(footprint, LOUNGE_ZONE)) return 'inside'
-  if (polygonIntersectsRect(footprint, LOUNGE_ZONE)) return 'partial'
+  if (polygonInsideRect(footprint, zone)) return 'inside'
+  if (polygonIntersectsRect(footprint, zone)) return 'partial'
   return 'outside'
 }
 
 export function collisionIssues(
-  candidate: PlacedItem,
-  others: readonly PlacedItem[],
+  candidate: FurnitureInstance,
+  others: readonly FurnitureInstance[],
 ): ConstraintIssue[] {
   const footprint = footprintPolygon(candidate)
   const clearance = clearancePolygon(candidate)
@@ -48,7 +48,7 @@ export function collisionIssues(
     if (other.id === candidate.id) continue
     const otherFootprint = footprintPolygon(other)
     const otherClearance = clearancePolygon(other)
-    const otherName = FURNITURE_BY_ID[other.id].label
+    const otherName = definitionOf(other.typeId).name
 
     if (polygonsOverlap(footprint, otherFootprint)) {
       issues.push({ code: 'overlap', reason: `Overlaps ${otherName}` })
@@ -63,15 +63,16 @@ export function collisionIssues(
 }
 
 export function classifyItem(
-  item: PlacedItem,
-  others: readonly PlacedItem[],
+  item: FurnitureInstance,
+  others: readonly FurnitureInstance[],
+  zone: RectMm,
 ): ConstraintResult {
-  const zone = zoneRelation(item)
+  const zoneState = zoneRelation(item, zone)
 
   if (item.locked) {
     return {
       state: 'locked',
-      zone,
+      zone: zoneState,
       ok: true,
       canLock: false,
       reason: 'Position locked',
@@ -79,10 +80,10 @@ export function classifyItem(
     }
   }
 
-  if (zone === 'outside') {
+  if (zoneState === 'outside') {
     return {
       state: 'outside',
-      zone,
+      zone: zoneState,
       ok: true,
       canLock: false,
       reason: 'Outside constrained zone — free placement',
@@ -90,11 +91,11 @@ export function classifyItem(
     }
   }
 
-  if (zone === 'partial') {
+  if (zoneState === 'partial') {
     const issues: ConstraintIssue[] = [{ code: 'partial', reason: 'Partly outside the Lounge Zone' }]
     return {
       state: 'partial',
-      zone,
+      zone: zoneState,
       ok: false,
       canLock: false,
       reason: 'Partly outside the Lounge Zone',
@@ -106,7 +107,7 @@ export function classifyItem(
   if (issues.length > 0) {
     return {
       state: 'inside-invalid',
-      zone,
+      zone: zoneState,
       ok: false,
       canLock: false,
       reason: firstReason(issues, 'Blocks required clearance'),
@@ -116,7 +117,7 @@ export function classifyItem(
 
   return {
     state: 'inside-valid',
-    zone,
+    zone: zoneState,
     ok: true,
     canLock: true,
     reason: 'Valid placement — ready to lock',

@@ -23,40 +23,26 @@ Frontend-only. The app runs in the browser.
 - No backend
 - No database
 - No authentication
-- No AI API
-- No 3D
-- No external copyrighted assets (no stock photos, licensed 3D models, or third-party brand furniture imagery)
+- No AI API or LLM layout
+- No 3D / Three.js / 360 view
+- No doors or windows
+- No 3ds Max integration
+- No external copyrighted assets
 
-## First-step UI (this version)
+## Current MVP
 
-Create **only a static interface**. Do not implement interaction or logic that was not requested.
-
-### Included
-
-- Header with the name “ZoneFit”
-- Subtitle as specified
-- Large top-down room canvas
-- Room size: **6000 × 4500 mm**
-- Visible grid
-- One highlighted rectangular area labeled **Lounge Zone**
-- Simple top-view CSS furniture shapes: sofa, lounge chair, coffee table, side table
-- Control panel with furniture selection
-- Primary button labeled **Arrange in Zone**
-- Small legend for **Footprint**, **Clearance**, **Valid**, and **Conflict**
-- Desktop-first layout
-- Visual direction: clean professional archviz tool, warm neutral background, strong orange accent, clear readable labels, slightly playful but not game-like or childish
-
-### Not included yet
-
-- Dragging furniture
-- Placement algorithm
-- Collision / clearance calculation
-- Saving, sharing, or exporting layouts
-- Additional rooms, zones, or furniture types
-- Responsive mobile layout as a design target
+- Guided and Variants modes
+- Furniture **definitions** (catalog types) are separate from **scene instances**
+- Catalog cards create instances by drag or **+ Add**; the same type can be placed more than once (max 12 objects)
+- Inspector for the selected instance: rotate ±45°, lock, duplicate, delete, include in variants
+- Millimetre scene, oriented footprints, SAT collision, 300 mm guide grid with true remainder strips
+- Editable room width/depth/height and Lounge Zone width/depth (height stored only for a future 3D preview)
+- Deterministic seeded variant search on included, unlocked instances
 
 ## Design constraints
 
 - Single page
 - CSS shapes only for furniture (top view)
 - Original, non-copyrighted graphics only
+- Desktop-first; usable at 1440 × 900
+- Warm architectural visual direction

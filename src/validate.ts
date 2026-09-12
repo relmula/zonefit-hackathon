@@ -1,5 +1,5 @@
 import { classifyItem, collisionIssues, type ConstraintIssue } from './constraint'
-import { type PlacedItem } from './model'
+import { type FurnitureInstance, type RectMm } from './model'
 
 export type ValidationIssue = {
   code: ConstraintIssue['code'] | 'outside-zone'
@@ -22,11 +22,12 @@ function result(issues: ValidationIssue[]): ValidationResult {
 
 /** Strict check used by automatic generation: the item must be inside-valid. */
 export function validateItem(
-  candidate: PlacedItem,
-  others: readonly PlacedItem[],
+  candidate: FurnitureInstance,
+  others: readonly FurnitureInstance[],
+  zone: RectMm,
 ): ValidationResult {
   const unlocked = { ...candidate, locked: false }
-  const assessment = classifyItem(unlocked, others)
+  const assessment = classifyItem(unlocked, others, zone)
   if (assessment.state === 'inside-valid') return result([])
   if (assessment.state === 'outside') {
     return result([{ code: 'outside-zone', reason: 'Outside the Lounge Zone' }])
@@ -34,15 +35,21 @@ export function validateItem(
   return result(assessment.issues)
 }
 
-export function validateLayout(items: readonly PlacedItem[]): ValidationResult {
+export function validateLayout(
+  items: readonly FurnitureInstance[],
+  zone: RectMm,
+): ValidationResult {
   for (const item of items) {
     const others = items.filter((entry) => entry.id !== item.id)
-    const current = validateItem(item, others)
+    const current = validateItem(item, others, zone)
     if (!current.ok) return current
   }
   return result([])
 }
 
-export function hasCollision(candidate: PlacedItem, others: readonly PlacedItem[]): boolean {
+export function hasCollision(
+  candidate: FurnitureInstance,
+  others: readonly FurnitureInstance[],
+): boolean {
   return collisionIssues(candidate, others).length > 0
 }
