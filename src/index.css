@@ -2,17 +2,24 @@
 
 @theme {
   --font-sans: "Segoe UI", system-ui, sans-serif;
-  --color-ink: #2c241c;
-  --color-muted: #6d645b;
-  --color-paper: #f4eee6;
-  --color-panel: #fffaf5;
-  --color-line: #e4d8cc;
-  --color-accent: #e25a1c;
-  --color-accent-dark: #c44812;
-  --color-valid: #2f7d4a;
-  --color-conflict: #c43c2e;
-  --color-clearance: #8bb8c9;
-  --color-footprint: #3d4a55;
+  --font-serif: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  --color-ink: #2a241e;
+  --color-muted: #7a6d62;
+  --color-paper: #f2ece3;
+  --color-panel: #faf6ef;
+  --color-stone: #e6dccf;
+  --color-line: #d4c6b4;
+  --color-oak: #c4a574;
+  --color-walnut: #5c4030;
+  --color-linen: #e7d9c6;
+  --color-limestone: #ece4d8;
+  --color-cove: #f3e6c8;
+  --color-accent: #c45124;
+  --color-accent-dark: #a3441d;
+  --color-valid: #6a7d58;
+  --color-conflict: #9c5c4e;
+  --color-clearance: #8d979c;
+  --color-footprint: #4e443c;
 }
 
 html,
@@ -26,6 +33,15 @@ body {
   background: var(--color-paper);
   color: var(--color-ink);
   font-family: var(--font-sans);
+}
+
+button {
+  transition:
+    background-color 180ms ease,
+    color 180ms ease,
+    border-color 180ms ease,
+    box-shadow 180ms ease,
+    opacity 180ms ease;
 }
 
 @media (prefers-reduced-motion: reduce) {
