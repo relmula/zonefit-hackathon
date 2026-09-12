@@ -86,19 +86,19 @@ export function classifyItem(
       zone: zoneState,
       ok: true,
       canLock: false,
-      reason: 'Outside constrained zone — free placement',
+      reason: 'Outside the Active Area — free placement',
       issues: [],
     }
   }
 
   if (zoneState === 'partial') {
-    const issues: ConstraintIssue[] = [{ code: 'partial', reason: 'Partly outside the Lounge Zone' }]
+    const issues: ConstraintIssue[] = [{ code: 'partial', reason: 'Partly outside the Active Area' }]
     return {
       state: 'partial',
       zone: zoneState,
       ok: false,
       canLock: false,
-      reason: 'Partly outside the Lounge Zone',
+      reason: 'Partly outside the Active Area',
       issues,
     }
   }
@@ -128,7 +128,7 @@ export function classifyItem(
 export function lockDisabledReason(result: ConstraintResult): string | null {
   if (result.state === 'locked') return null
   if (result.canLock) return null
-  if (result.state === 'outside') return 'Outside constrained zone — free placement'
-  if (result.state === 'partial') return 'Partly outside the Lounge Zone'
+  if (result.state === 'outside') return 'Outside the Active Area — free placement'
+  if (result.state === 'partial') return 'Partly outside the Active Area'
   return result.reason
 }

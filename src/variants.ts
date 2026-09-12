@@ -3,6 +3,7 @@ import {
   CARDINAL_ROTATIONS,
   FURNITURE_TYPE_IDS,
   GRID_MM,
+  SOFA_VARIANT_ROTATIONS,
   centerOf,
   clearanceBudget,
   definitionOf,
@@ -21,7 +22,7 @@ import {
   type Rotation,
 } from './model'
 import { createRng, pickIndex, shuffleInPlace } from './rng'
-import { axisCandidates, snapPoint } from './snap'
+import { gridAxisWithin, snapCentreToVisibleGrid } from './snap'
 import { validateItem } from './validate'
 
 export type VariantResult =
@@ -102,17 +103,30 @@ function snapInsideZone(
   zone: RectMm,
   room: RoomSettings,
 ): FurnitureInstance {
+  const snapped = snapCentreToVisibleGrid({ x: item.xMm, y: item.yMm }, room)
+  const next = { ...item, xMm: snapped.x, yMm: snapped.y }
+  if (isInsideZone(next, zone, room)) return next
+
   const extX = halfExtent(item, { x: 1, y: 0 })
   const extY = halfExtent(item, { x: 0, y: 1 })
-  const minX = zone.x + extX
-  const maxX = zone.x + zone.w - extX
-  const minY = zone.y + extY
-  const maxY = zone.y + zone.h - extY
-  const snapped = snapPoint({ x: item.xMm, y: item.yMm })
-  const x = Math.min(maxX, Math.max(minX, snapped.x))
-  const y = Math.min(maxY, Math.max(minY, snapped.y))
-  const next = { ...item, xMm: x, yMm: y }
-  return itemFitsRoom(next, room) ? next : item
+  const xs = gridAxisWithin(zone.x + extX, zone.x + zone.w - extX, room.widthMm)
+  const ys = gridAxisWithin(zone.y + extY, zone.y + zone.h - extY, room.depthMm)
+  if (xs.length === 0 || ys.length === 0) return next
+
+  let best = next
+  let bestDist = Infinity
+  for (const y of ys) {
+    for (const x of xs) {
+      const candidate = { ...item, xMm: x, yMm: y }
+      if (!isInsideZone(candidate, zone, room)) continue
+      const dist = Math.hypot(x - item.xMm, y - item.yMm)
+      if (dist < bestDist) {
+        best = candidate
+        bestDist = dist
+      }
+    }
+  }
+  return best
 }
 
 function isInsideZone(item: FurnitureInstance, zone: RectMm, room: RoomSettings): boolean {
@@ -133,6 +147,16 @@ function placeRelative(
   return snapInsideZone({ ...source, xMm: center.x, yMm: center.y, rotationDeg: rotation }, zone, room)
 }
 
+function sofaRotationForEdge(edge: Edge): Rotation {
+  return edge === 'bottom' || edge === 'right' ? 180 : 0
+}
+
+function variantRotations(typeId: FurnitureTypeId): readonly Rotation[] {
+  if (typeId === 'sofa') return SOFA_VARIANT_ROTATIONS
+  if (typeId === 'chair') return definitionOf(typeId).allowedVariantRotations
+  return CARDINAL_ROTATIONS
+}
+
 function placeOnEdge(
   source: FurnitureInstance,
   edge: Edge,
@@ -140,8 +164,8 @@ function placeOnEdge(
   inset: number,
   zone: RectMm,
   room: RoomSettings,
+  rotation = source.typeId === 'sofa' ? sofaRotationForEdge(edge) : EDGE_ROTATION[edge],
 ): FurnitureInstance {
-  const rotation = EDGE_ROTATION[edge]
   const sample = { ...source, rotationDeg: rotation }
   const extX = halfExtent(sample, { x: 1, y: 0 })
   const extY = halfExtent(sample, { x: 0, y: 1 })
@@ -452,8 +476,8 @@ function gridCenters(
   const sample = probe(typeId, rotation)
   const extX = halfExtent(sample, { x: 1, y: 0 })
   const extY = halfExtent(sample, { x: 0, y: 1 })
-  const xs = axisCandidates(zone.x + extX, zone.x + zone.w - extX)
-  const ys = axisCandidates(zone.y + extY, zone.y + zone.h - extY)
+  const xs = gridAxisWithin(zone.x + extX, zone.x + zone.w - extX, room.widthMm)
+  const ys = gridAxisWithin(zone.y + extY, zone.y + zone.h - extY, room.depthMm)
   const points: PointMm[] = []
   for (const y of ys) {
     for (const x of xs) {
@@ -500,8 +524,7 @@ function fallbackFill(
 
     const source = remaining[index]
     const options: FurnitureInstance[] = []
-    const rotations =
-      source.typeId === 'chair' ? definitionOf(source.typeId).allowedVariantRotations : CARDINAL_ROTATIONS
+    const rotations = variantRotations(source.typeId)
     for (const rotation of rotations) {
       for (const pos of gridCenters(source.typeId, rotation, zone, room)) {
         const item = { ...source, xMm: pos.x, yMm: pos.y, rotationDeg: rotation, locked: false }
@@ -713,7 +736,11 @@ export function generateVariant(input: VariantInput): VariantResult {
     const generated = scene.filter((item) => item.includedInVariants && !item.locked)
     if (
       generated.some(
-        (item) => !validateItem(item, scene.filter((other) => other.id !== item.id), zone).ok,
+        (item) =>
+          !validateItem(item, scene.filter((other) => other.id !== item.id), zone).ok ||
+          Math.abs(item.xMm - Math.round(item.xMm / GRID_MM) * GRID_MM) > 0.01 ||
+          Math.abs(item.yMm - Math.round(item.yMm / GRID_MM) * GRID_MM) > 0.01 ||
+          (item.typeId === 'sofa' && item.rotationDeg !== 0 && item.rotationDeg !== 180),
       )
     ) {
       continue

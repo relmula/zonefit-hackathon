@@ -1,12 +1,13 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, lazy, Suspense, type PointerEvent as ReactPointerEvent } from 'react'
 import {
   ChairShape,
   CoffeeTableShape,
   SideTableShape,
   SofaShape,
 } from './FurnitureShapes'
-import { classifyItem, lockDisabledReason, type ConstraintResult } from './constraint'
 import {
+  AREA_SIZE_MAX_MM,
+  AREA_SIZE_MIN_MM,
   DEFAULT_ROOM,
   DEFAULT_ZONE,
   DIMENSION_STEP_MM,
@@ -14,21 +15,13 @@ import {
   GRID_MM,
   INITIAL_INSTANCE_SEQ,
   MAX_INSTANCES,
-  ROOM_DEPTH_MAX_MM,
-  ROOM_DEPTH_MIN_MM,
-  ROOM_HEIGHT_MAX_MM,
-  ROOM_HEIGHT_MIN_MM,
-  ROOM_WIDTH_MAX_MM,
-  ROOM_WIDTH_MIN_MM,
-  ZONE_SIZE_MIN_MM,
-  centerZoneInRoom,
   clampItemToRoom,
   createInitialInstances,
   definitionOf,
   formatMmSize,
   formatMmVolume,
   instanceLabel,
-  keepZoneInsideRoom,
+  layoutFromArea,
   mmToPercent,
   nextRotation,
   type FurnitureInstance,
@@ -38,7 +31,11 @@ import {
   type RectMm,
   type RoomSettings,
 } from './model'
+import { classifyPlacement, committedLayoutAllowed, fieldToneClass } from './placement'
+import { snapCentreToVisibleGrid } from './snap'
 import { generateVariant } from './variants'
+
+const MakeRealModal = lazy(() => import('./MakeRealModal'))
 
 const LABEL_SIDE_PX = 40
 const LABEL_TOP_PX = 28
@@ -46,28 +43,17 @@ const LABEL_TOP_PX = 28
 type Status =
   | { kind: 'success'; message: string }
   | { kind: 'error'; message: string }
+  | { kind: 'info'; message: string }
   | null
 
-type DragSession = {
-  id: string
-  origin: PointMm
+type InteractionMode = 'idle' | 'dragging' | 'held'
+
+type PlacementSession = {
+  mode: Exclude<InteractionMode, 'idle'>
+  source: 'existing' | 'catalog'
+  origin: FurnitureInstance | null
   grab: PointMm
-  pointerId: number
-  moved: boolean
-}
-
-type CatalogDrag = {
-  typeId: FurnitureTypeId
-  pointerId: number
-  xMm: number
-  yMm: number
-  overRoom: boolean
-}
-
-type Preview = {
-  id: string
-  xMm: number
-  yMm: number
+  preview: FurnitureInstance
 }
 
 function FurnitureGlyph({ typeId }: { typeId: FurnitureTypeId }) {
@@ -96,10 +82,9 @@ function pointerToMm(
   }
 }
 
-function fieldClass(result: ConstraintResult): string {
-  if (result.state === 'inside-valid') return 'bg-valid/35'
-  if (result.state === 'locked') return 'bg-clearance/25'
-  return 'bg-conflict/35'
+function isUiChrome(target: EventTarget | null): boolean {
+  if (!(target instanceof Element)) return false
+  return Boolean(target.closest('[data-placement-chrome]'))
 }
 
 function spawnPoint(
@@ -123,7 +108,7 @@ function spawnPoint(
     includedInVariants: true,
   }
   const clamped = clampItemToRoom(probe, room)
-  return { x: clamped.xMm, y: clamped.yMm }
+  return snapCentreToVisibleGrid({ x: clamped.xMm, y: clamped.yMm }, room)
 }
 
 function NumberField({
@@ -159,11 +144,11 @@ function NumberField({
 
 function App() {
   const stageRef = useRef<HTMLDivElement>(null)
-  const roomRef = useRef<HTMLDivElement>(null)
-  const dragRef = useRef<DragSession | null>(null)
-  const catalogDragRef = useRef<CatalogDrag | null>(null)
-  const previewRef = useRef<Preview | null>(null)
+  const roomElRef = useRef<HTMLDivElement>(null)
+  const sessionRef = useRef<PlacementSession | null>(null)
   const instancesRef = useRef(createInitialInstances())
+  const roomRef = useRef<RoomSettings>(DEFAULT_ROOM)
+  const zoneRef = useRef<RectMm>(DEFAULT_ZONE)
   const seqRef = useRef(INITIAL_INSTANCE_SEQ)
 
   const [room, setRoom] = useState<RoomSettings>(DEFAULT_ROOM)
@@ -172,18 +157,30 @@ function App() {
   const [mode, setMode] = useState<Mode>('guided')
   const [instances, setInstances] = useState<FurnitureInstance[]>(createInitialInstances)
   const [activeId, setActiveId] = useState<string | null>('sofa-1')
-  const [preview, setPreview] = useState<Preview | null>(null)
-  const [draggingId, setDraggingId] = useState<string | null>(null)
-  const [catalogDrag, setCatalogDrag] = useState<CatalogDrag | null>(null)
+  const [session, setSession] = useState<PlacementSession | null>(null)
   const [animate, setAnimate] = useState(false)
   const [status, setStatus] = useState<Status>(null)
   const [variantIndex, setVariantIndex] = useState(0)
   const [variantSeed, setVariantSeed] = useState(1)
   const [recentSignatures, setRecentSignatures] = useState<string[]>([])
+  const [makeRealOpen, setMakeRealOpen] = useState(false)
+
+  const writeSession = (next: PlacementSession | null) => {
+    sessionRef.current = next
+    setSession(next)
+  }
 
   useEffect(() => {
     instancesRef.current = instances
   }, [instances])
+
+  useEffect(() => {
+    roomRef.current = room
+  }, [room])
+
+  useEffect(() => {
+    zoneRef.current = zone
+  }, [zone])
 
   useLayoutEffect(() => {
     const stage = stageRef.current
@@ -208,15 +205,10 @@ function App() {
   }, [room.widthMm, room.depthMm])
 
   const liveInstances = (): FurnitureInstance[] => {
-    if (!preview) return instances
-    return instances.map((item) =>
-      item.id === preview.id ? { ...item, xMm: preview.xMm, yMm: preview.yMm } : item,
-    )
-  }
-
-  const displayItem = (item: FurnitureInstance): FurnitureInstance => {
-    if (preview && preview.id === item.id) return { ...item, xMm: preview.xMm, yMm: preview.yMm }
-    return item
+    const current = session
+    if (!current) return instances
+    if (current.source === 'catalog') return [...instances, current.preview]
+    return instances.map((item) => (item.id === current.preview.id ? current.preview : item))
   }
 
   const othersOf = (id: string, source: FurnitureInstance[]) => source.filter((item) => item.id !== id)
@@ -227,49 +219,177 @@ function App() {
     return id
   }
 
-  const createAt = (typeId: FurnitureTypeId, point: PointMm) => {
-    if (instancesRef.current.length >= MAX_INSTANCES) {
-      setStatus({ kind: 'error', message: `Scene limit reached (${MAX_INSTANCES} objects)` })
-      return
-    }
-    const probe: FurnitureInstance = {
-      id: allocId(typeId),
-      typeId,
-      xMm: point.x,
-      yMm: point.y,
-      rotationDeg: 0,
-      locked: false,
-      includedInVariants: true,
-    }
-    const next = clampItemToRoom(probe, room)
-    setInstances((current) => [...current, next])
-    setActiveId(next.id)
-    setStatus(null)
-  }
-
   const commitItem = (id: string, patch: Partial<FurnitureInstance>) => {
     setInstances((current) => current.map((item) => (item.id === id ? { ...item, ...patch } : item)))
   }
 
+  const cancelSession = useCallback(() => {
+    const current = sessionRef.current
+    if (!current) return
+    writeSession(null)
+    setAnimate(false)
+    if (current.source === 'catalog') {
+      setActiveId(instancesRef.current[0]?.id ?? null)
+      setStatus({ kind: 'info', message: 'Unplaced catalog object removed' })
+      return
+    }
+    setActiveId(current.origin?.id ?? current.preview.id)
+    setStatus({ kind: 'info', message: 'Placement cancelled' })
+  }, [])
+
+  const placePreview = useCallback((preview: FurnitureInstance) => {
+    const others = instancesRef.current.filter((item) => item.id !== preview.id)
+    const result = classifyPlacement(preview, others, zoneRef.current, roomRef.current)
+    if (!result.allowed) return false
+    const current = sessionRef.current
+    if (current?.source === 'catalog') {
+      setInstances((items) => [...items, preview])
+    } else {
+      commitItem(preview.id, {
+        xMm: preview.xMm,
+        yMm: preview.yMm,
+        rotationDeg: preview.rotationDeg,
+      })
+    }
+    writeSession(null)
+    setActiveId(preview.id)
+    setAnimate(false)
+    setStatus(null)
+    return true
+  }, [])
+
+  const applyPointerToPreview = useCallback((event: PointerEvent | ReactPointerEvent) => {
+    const current = sessionRef.current
+    if (!current) return current
+    const roomBox = roomElRef.current?.getBoundingClientRect()
+    const roomNow = roomRef.current
+    if (!roomBox) return current
+    const mm = pointerToMm(event, roomBox, roomNow)
+    const snapped = snapCentreToVisibleGrid({ x: mm.x - current.grab.x, y: mm.y - current.grab.y }, roomNow)
+    if (snapped.x === current.preview.xMm && snapped.y === current.preview.yMm) return current
+    const next: PlacementSession = {
+      ...current,
+      preview: { ...current.preview, xMm: snapped.x, yMm: snapped.y },
+    }
+    writeSession(next)
+    return next
+  }, [])
+
+  const tryPlaceOrHold = useCallback(
+    (event: PointerEvent, updateFromPointer: boolean) => {
+      const current = sessionRef.current
+      if (!current) return
+      const next = updateFromPointer && !isUiChrome(event.target) ? applyPointerToPreview(event) : current
+      if (!next) return
+      if (placePreview(next.preview)) return
+      if (next.mode === 'dragging') {
+        writeSession({ ...next, mode: 'held' })
+        setStatus({
+          kind: 'info',
+          message: 'Invalid grid — item stays held. Click a valid cell, or Esc / right-click to cancel.',
+        })
+      }
+    },
+    [applyPointerToPreview, placePreview],
+  )
+
+  const beginExistingDrag = (item: FurnitureInstance, event: ReactPointerEvent, grab: PointMm) => {
+    const roomNow = roomRef.current
+    const snapped = snapCentreToVisibleGrid({ x: item.xMm, y: item.yMm }, roomNow)
+    const preview = { ...item, locked: false, xMm: snapped.x, yMm: snapped.y }
+    setAnimate(false)
+    setActiveId(item.id)
+    setStatus({ kind: 'info', message: 'Snapped to 300 mm grid. Release on green or free cell to place.' })
+    writeSession({
+      mode: 'dragging',
+      source: 'existing',
+      origin: { ...item },
+      grab,
+      preview,
+    })
+    applyPointerToPreview(event)
+  }
+
+  const beginCatalogDrag = (typeId: FurnitureTypeId, event: ReactPointerEvent) => {
+    if (sessionRef.current) return
+    if (instancesRef.current.length >= MAX_INSTANCES) {
+      setStatus({ kind: 'error', message: `Scene limit reached (${MAX_INSTANCES} objects)` })
+      return
+    }
+    const roomBox = roomElRef.current?.getBoundingClientRect()
+    const roomNow = roomRef.current
+    const mm = roomBox ? pointerToMm(event, roomBox, roomNow) : spawnPoint(typeId, instancesRef.current, roomNow, zoneRef.current)
+    const snapped = snapCentreToVisibleGrid(mm, roomNow)
+    const preview: FurnitureInstance = {
+      id: allocId(typeId),
+      typeId,
+      xMm: snapped.x,
+      yMm: snapped.y,
+      rotationDeg: 0,
+      locked: false,
+      includedInVariants: true,
+    }
+    setAnimate(false)
+    setActiveId(preview.id)
+    setStatus({ kind: 'info', message: 'Holding new object. Click a valid grid cell to place.' })
+    writeSession({
+      mode: 'dragging',
+      source: 'catalog',
+      origin: null,
+      grab: { x: 0, y: 0 },
+      preview,
+    })
+    applyPointerToPreview(event)
+  }
+
   const handleRotate = useCallback(
     (step: number) => {
+      const current = sessionRef.current
+      if (current) {
+        const rotated = {
+          ...current.preview,
+          rotationDeg: nextRotation(current.preview.rotationDeg, step),
+        }
+        writeSession({ ...current, preview: rotated })
+        setAnimate(false)
+        setStatus(null)
+        return
+      }
       if (!activeId) return
       const item = instancesRef.current.find((entry) => entry.id === activeId)
       if (!item || item.locked) return
-      setAnimate(false)
-      const rotated = clampItemToRoom(
-        { ...item, rotationDeg: nextRotation(item.rotationDeg, step) },
-        room,
+      const rotated = { ...item, rotationDeg: nextRotation(item.rotationDeg, step) }
+      const result = classifyPlacement(
+        rotated,
+        instancesRef.current.filter((entry) => entry.id !== item.id),
+        zoneRef.current,
+        roomRef.current,
       )
-      commitItem(activeId, { xMm: rotated.xMm, yMm: rotated.yMm, rotationDeg: rotated.rotationDeg })
-      setStatus(null)
+      setAnimate(false)
+      if (result.allowed) {
+        commitItem(activeId, { rotationDeg: rotated.rotationDeg })
+        setStatus(null)
+        return
+      }
+      writeSession({
+        mode: 'held',
+        source: 'existing',
+        origin: { ...item },
+        grab: { x: 0, y: 0 },
+        preview: rotated,
+      })
+      setStatus({
+        kind: 'info',
+        message: 'Rotation is invalid here — item stays held until placed or cancelled.',
+      })
     },
-    [activeId, room],
+    [activeId],
   )
 
   const handleLockToggle = () => {
+    if (sessionRef.current) return
     if (!activeId) return
-    const source = liveInstances()
+    const source = instancesRef.current
     const item = source.find((entry) => entry.id === activeId)
     if (!item) return
     if (item.locked) {
@@ -277,39 +397,62 @@ function App() {
       setStatus(null)
       return
     }
-    const result = classifyItem(item, othersOf(activeId, source), zone)
-    if (!result.canLock) return
+    const result = classifyPlacement(item, othersOf(activeId, source), zone, room)
+    if (!result.allowed || result.tone !== 'valid') return
     commitItem(activeId, { locked: true })
     setStatus(null)
   }
 
   const handleDuplicate = () => {
-    if (!activeId) return
+    if (sessionRef.current) return
     if (instances.length >= MAX_INSTANCES) {
       setStatus({ kind: 'error', message: `Scene limit reached (${MAX_INSTANCES} objects)` })
       return
     }
     const item = instances.find((entry) => entry.id === activeId)
     if (!item) return
-    const copy = clampItemToRoom(
-      {
-        ...item,
-        id: allocId(item.typeId),
-        xMm: item.xMm + GRID_MM,
-        yMm: item.yMm + GRID_MM,
-        locked: false,
-      },
-      room,
-    )
-    setInstances((current) => [...current, copy])
+    const copy: FurnitureInstance = {
+      ...item,
+      id: allocId(item.typeId),
+      xMm: item.xMm + GRID_MM,
+      yMm: item.yMm + GRID_MM,
+      locked: false,
+    }
+    const snapped = snapCentreToVisibleGrid({ x: copy.xMm, y: copy.yMm }, room)
+    copy.xMm = snapped.x
+    copy.yMm = snapped.y
+    const result = classifyPlacement(copy, instances, zone, room)
+    if (result.allowed) {
+      setInstances((current) => [...current, copy])
+      setActiveId(copy.id)
+      setStatus(null)
+      return
+    }
+    writeSession({
+      mode: 'held',
+      source: 'catalog',
+      origin: null,
+      grab: { x: 0, y: 0 },
+      preview: copy,
+    })
     setActiveId(copy.id)
-    setStatus(null)
+    setStatus({
+      kind: 'info',
+      message: 'Duplicate is invalid here — click a valid grid cell to place.',
+    })
   }
 
   const handleDelete = () => {
-    if (!activeId) return
-    setInstances((current) => {
-      const next = current.filter((item) => item.id !== activeId)
+    const current = sessionRef.current
+    if (current?.source === 'catalog') {
+      cancelSession()
+      return
+    }
+    const id = current?.origin?.id ?? activeId
+    if (!id) return
+    writeSession(null)
+    setInstances((items) => {
+      const next = items.filter((item) => item.id !== id)
       setActiveId(next[0]?.id ?? null)
       return next
     })
@@ -317,6 +460,7 @@ function App() {
   }
 
   const handleGenerate = () => {
+    if (sessionRef.current) return
     setAnimate(true)
     const result = generateVariant({
       instances,
@@ -342,192 +486,193 @@ function App() {
   }
 
   const handleReset = () => {
-    dragRef.current = null
-    catalogDragRef.current = null
-    previewRef.current = null
+    writeSession(null)
     seqRef.current = INITIAL_INSTANCE_SEQ
     setRoom(DEFAULT_ROOM)
     setZone(DEFAULT_ZONE)
     setInstances(createInitialInstances())
     setActiveId('sofa-1')
-    setPreview(null)
-    setDraggingId(null)
-    setCatalogDrag(null)
     setAnimate(false)
     setStatus(null)
     setVariantIndex(0)
     setVariantSeed(1)
     setRecentSignatures([])
     setMode('guided')
+    setMakeRealOpen(false)
   }
 
-  const applyRoom = (patch: Partial<RoomSettings>) => {
-    const nextRoom: RoomSettings = {
-      widthMm: Math.min(ROOM_WIDTH_MAX_MM, Math.max(ROOM_WIDTH_MIN_MM, Math.round(patch.widthMm ?? room.widthMm))),
-      depthMm: Math.min(ROOM_DEPTH_MAX_MM, Math.max(ROOM_DEPTH_MIN_MM, Math.round(patch.depthMm ?? room.depthMm))),
-      heightMm: Math.min(ROOM_HEIGHT_MAX_MM, Math.max(ROOM_HEIGHT_MIN_MM, Math.round(patch.heightMm ?? room.heightMm))),
-    }
-    const nextZone = keepZoneInsideRoom(nextRoom, zone)
+  const applyAreaSize = (widthMm: number, depthMm: number) => {
+    if (sessionRef.current) return
+    const next = layoutFromArea(widthMm, depthMm)
+    const dx = next.zone.x - zone.x
+    const dy = next.zone.y - zone.y
     let moved = 0
     const nextInstances = instances.map((item) => {
-      const clamped = clampItemToRoom(item, nextRoom)
+      const shifted = { ...item, xMm: item.xMm + dx, yMm: item.yMm + dy }
+      const clamped = clampItemToRoom(shifted, next.room)
       if (clamped.xMm !== item.xMm || clamped.yMm !== item.yMm) moved += 1
       return clamped
     })
-    setRoom(nextRoom)
-    setZone(nextZone)
+    setRoom(next.room)
+    setZone(next.zone)
     setInstances(nextInstances)
     if (moved > 0) {
       setStatus({
         kind: 'success',
-        message: `${moved} object${moved === 1 ? ' was' : 's were'} moved to stay inside the room`,
+        message: `${moved} object${moved === 1 ? ' was' : 's were'} moved to stay inside the staging room`,
       })
     }
   }
 
-  const applyZoneSize = (widthMm: number, depthMm: number) => {
-    const w = Math.min(room.widthMm, Math.max(ZONE_SIZE_MIN_MM, Math.round(widthMm)))
-    const h = Math.min(room.depthMm, Math.max(ZONE_SIZE_MIN_MM, Math.round(depthMm)))
-    setZone(centerZoneInRoom(room, w, h))
-  }
-
-  const onPointerDown = (event: ReactPointerEvent<HTMLDivElement>, id: string) => {
+  const onItemPointerDown = (event: ReactPointerEvent<HTMLDivElement>, id: string) => {
     event.stopPropagation()
     event.preventDefault()
+    if (sessionRef.current) return
     setActiveId(id)
     setStatus(null)
     const item = instances.find((entry) => entry.id === id)
     if (!item || item.locked) return
-    const roomBox = roomRef.current?.getBoundingClientRect()
+    const roomBox = roomElRef.current?.getBoundingClientRect()
     if (!roomBox) return
     const mm = pointerToMm(event, roomBox, room)
-    dragRef.current = {
-      id,
-      origin: { x: item.xMm, y: item.yMm },
-      grab: { x: mm.x - item.xMm, y: mm.y - item.yMm },
-      pointerId: event.pointerId,
-      moved: false,
-    }
-    event.currentTarget.setPointerCapture(event.pointerId)
-  }
-
-  const onPointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
-    const drag = dragRef.current
-    if (!drag) return
-    const roomBox = roomRef.current?.getBoundingClientRect()
-    if (!roomBox) return
-    const mm = pointerToMm(event, roomBox, room)
-    const desired = { x: mm.x - drag.grab.x, y: mm.y - drag.grab.y }
-    if (!drag.moved && Math.hypot(desired.x - drag.origin.x, desired.y - drag.origin.y) < 12) return
-    drag.moved = true
-    setAnimate(false)
-    setDraggingId(drag.id)
-    const item = instancesRef.current.find((entry) => entry.id === drag.id)
-    if (!item) return
-    const clamped = clampItemToRoom({ ...item, xMm: desired.x, yMm: desired.y }, room)
-    const nextPreview: Preview = { id: drag.id, xMm: clamped.xMm, yMm: clamped.yMm }
-    previewRef.current = nextPreview
-    setPreview(nextPreview)
-  }
-
-  const onPointerUp = (event: ReactPointerEvent<HTMLDivElement>) => {
-    const drag = dragRef.current
-    if (!drag) return
-    if (event.currentTarget.hasPointerCapture(drag.pointerId)) {
-      event.currentTarget.releasePointerCapture(drag.pointerId)
-    }
-    const currentPreview = previewRef.current
-    if (drag.moved && currentPreview && currentPreview.id === drag.id) {
-      commitItem(drag.id, { xMm: currentPreview.xMm, yMm: currentPreview.yMm })
-    }
-    dragRef.current = null
-    previewRef.current = null
-    setDraggingId(null)
-    setPreview(null)
+    beginExistingDrag(item, event, { x: mm.x - item.xMm, y: mm.y - item.yMm })
   }
 
   const onCatalogPointerDown = (event: ReactPointerEvent<HTMLElement>, typeId: FurnitureTypeId) => {
     event.preventDefault()
-    event.currentTarget.setPointerCapture(event.pointerId)
-    const roomBox = roomRef.current?.getBoundingClientRect()
-    const overRoom = Boolean(
-      roomBox &&
-        event.clientX >= roomBox.left &&
-        event.clientX <= roomBox.right &&
-        event.clientY >= roomBox.top &&
-        event.clientY <= roomBox.bottom,
-    )
-    const mm = roomBox ? pointerToMm(event, roomBox, room) : { x: 0, y: 0 }
-    const next: CatalogDrag = { typeId, pointerId: event.pointerId, xMm: mm.x, yMm: mm.y, overRoom }
-    catalogDragRef.current = next
-    setCatalogDrag(next)
-  }
-
-  const onCatalogPointerMove = (event: ReactPointerEvent<HTMLElement>) => {
-    const drag = catalogDragRef.current
-    if (!drag) return
-    const roomBox = roomRef.current?.getBoundingClientRect()
-    const overRoom = Boolean(
-      roomBox &&
-        event.clientX >= roomBox.left &&
-        event.clientX <= roomBox.right &&
-        event.clientY >= roomBox.top &&
-        event.clientY <= roomBox.bottom,
-    )
-    const mm = roomBox ? pointerToMm(event, roomBox, room) : { x: drag.xMm, y: drag.yMm }
-    const next = { ...drag, xMm: mm.x, yMm: mm.y, overRoom }
-    catalogDragRef.current = next
-    setCatalogDrag(next)
-  }
-
-  const onCatalogPointerUp = (event: ReactPointerEvent<HTMLElement>) => {
-    const drag = catalogDragRef.current
-    if (!drag) return
-    if (event.currentTarget.hasPointerCapture(drag.pointerId)) {
-      event.currentTarget.releasePointerCapture(drag.pointerId)
-    }
-    if (drag.overRoom) {
-      const probe: FurnitureInstance = {
-        id: 'ghost',
-        typeId: drag.typeId,
-        xMm: drag.xMm,
-        yMm: drag.yMm,
-        rotationDeg: 0,
-        locked: false,
-        includedInVariants: true,
-      }
-      const clamped = clampItemToRoom(probe, room)
-      createAt(drag.typeId, { x: clamped.xMm, y: clamped.yMm })
-    }
-    catalogDragRef.current = null
-    setCatalogDrag(null)
+    beginCatalogDrag(typeId, event)
   }
 
   const handleAdd = (typeId: FurnitureTypeId) => {
+    if (sessionRef.current) return
+    if (instances.length >= MAX_INSTANCES) {
+      setStatus({ kind: 'error', message: `Scene limit reached (${MAX_INSTANCES} objects)` })
+      return
+    }
     const point = spawnPoint(typeId, instances, room, zone)
-    createAt(typeId, point)
+    const preview: FurnitureInstance = {
+      id: allocId(typeId),
+      typeId,
+      xMm: point.x,
+      yMm: point.y,
+      rotationDeg: 0,
+      locked: false,
+      includedInVariants: true,
+    }
+    const result = classifyPlacement(preview, instances, zone, room)
+    if (result.allowed) {
+      setInstances((current) => [...current, preview])
+      setActiveId(preview.id)
+      setStatus(null)
+      return
+    }
+    writeSession({
+      mode: 'held',
+      source: 'catalog',
+      origin: null,
+      grab: { x: 0, y: 0 },
+      preview,
+    })
+    setActiveId(preview.id)
+    setStatus({
+      kind: 'info',
+      message: 'Cannot place here — item stays held. Click a valid grid cell.',
+    })
   }
 
   useEffect(() => {
+    const onMove = (event: PointerEvent) => {
+      const current = sessionRef.current
+      if (!current) return
+      if (current.mode === 'held' && isUiChrome(event.target)) return
+      applyPointerToPreview(event)
+    }
+    const onUp = (event: PointerEvent) => {
+      const current = sessionRef.current
+      if (!current || event.button !== 0) return
+      if (current.mode === 'dragging') {
+        if (isUiChrome(event.target)) {
+          writeSession({ ...current, mode: 'held' })
+          setStatus({
+            kind: 'info',
+            message: 'Item stays held. Click a valid grid cell to place, or Esc / right-click to cancel.',
+          })
+          return
+        }
+        tryPlaceOrHold(event, true)
+        return
+      }
+      if (isUiChrome(event.target)) return
+      tryPlaceOrHold(event, true)
+    }
+    const onContext = (event: MouseEvent) => {
+      if (!sessionRef.current) return
+      event.preventDefault()
+      cancelSession()
+    }
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp)
+    window.addEventListener('contextmenu', onContext)
+    return () => {
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+      window.removeEventListener('contextmenu', onContext)
+    }
+  }, [applyPointerToPreview, cancelSession, tryPlaceOrHold])
+
+  useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === 'r' || event.key === 'R') {
+      if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return
+      if (event.key === 'Escape') {
+        if (!sessionRef.current) return
+        event.preventDefault()
+        cancelSession()
+        return
+      }
+      if (event.key === 'q' || event.key === 'Q') {
+        event.preventDefault()
+        handleRotate(-45)
+        return
+      }
+      if (event.key === 'e' || event.key === 'E' || event.key === 'r' || event.key === 'R') {
         event.preventDefault()
         handleRotate(45)
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [handleRotate])
+  }, [cancelSession, handleRotate])
+
+  useEffect(() => {
+    const previous = document.body.style.cursor
+    document.body.style.cursor = session ? 'grabbing' : previous
+    return () => {
+      document.body.style.cursor = previous
+    }
+  }, [session])
 
   const source = liveInstances()
-  const active = activeId ? source.find((item) => item.id === activeId) ?? null : null
-  const activeResult = active ? classifyItem(active, othersOf(active.id, source), zone) : null
-  const lockReason = activeResult ? lockDisabledReason(activeResult) : null
+  const active = activeId ? (source.find((item) => item.id === activeId) ?? null) : null
+  const activeResult = active ? classifyPlacement(active, othersOf(active.id, source), zone, room) : null
+  const holding = session !== null
+  const lockReason =
+    !active || active.locked || holding || activeResult?.tone === 'valid' ? null : (activeResult?.reason ?? null)
   const gridPx = GRID_MM * roomPx.scale
+  const layoutOk = committedLayoutAllowed(instances, zone, room)
+  const makeRealDisabled = holding || !layoutOk.ok
+  const makeRealReason = holding
+    ? 'Place or cancel the held object first'
+    : layoutOk.ok
+      ? undefined
+      : `Layout is invalid (${layoutOk.reason})`
+  const aiApiUrl = import.meta.env.VITE_AI_API_URL
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-paper text-ink">
-      <header className="relative flex shrink-0 items-end justify-between gap-6 border-b border-line bg-panel px-6 py-3.5">
+      <header
+        data-placement-chrome="true"
+        className="relative flex shrink-0 items-end justify-between gap-6 border-b border-line bg-panel px-6 py-3.5"
+      >
         <div
           className="pointer-events-none absolute inset-x-0 -bottom-px h-8"
           style={{
@@ -546,8 +691,10 @@ function App() {
             Constraint-aware furniture placement for archviz
           </p>
         </div>
-        <p className="relative pb-0.5 text-[12px] text-muted">
-          {room.widthMm} × {room.depthMm} × {room.heightMm} mm · top view
+        <p className="relative pb-0.5 text-right text-[12px] text-muted">
+          Active Area {zone.w} × {zone.h} mm
+          <br />
+          Derived room {room.widthMm} × {room.depthMm} × {room.heightMm} mm · top view
         </p>
       </header>
 
@@ -575,7 +722,8 @@ function App() {
                   </div>
 
                   <div
-                    ref={roomRef}
+                    ref={roomElRef}
+                    data-room-canvas="true"
                     className="relative rounded-[16px] bg-[#f4efe6] shadow-[0_24px_50px_rgba(42,36,30,0.06),inset_0_1px_0_rgba(255,248,236,0.9)] outline outline-1 outline-line"
                     style={{
                       width: roomPx.width,
@@ -589,7 +737,7 @@ function App() {
                       backgroundRepeat: 'repeat',
                     }}
                     role="application"
-                    aria-label={`Top-down room canvas, ${room.widthMm} by ${room.depthMm} millimeters`}
+                    aria-label={`Top-down Active Area ${zone.w} by ${zone.h} millimeters, inside a derived staging room ${room.widthMm} by ${room.depthMm} millimeters`}
                   >
                     <div
                       className="pointer-events-none absolute"
@@ -605,20 +753,16 @@ function App() {
                       }}
                     >
                       <span className="absolute top-2.5 left-3 rounded-[10px] bg-panel px-2.5 py-0.5 text-[11px] font-medium text-ink">
-                        Lounge Zone
+                        Active Area
                       </span>
                     </div>
 
-                    {source.map((raw) => {
-                      const item = displayItem(raw)
+                    {source.map((item) => {
                       const def = definitionOf(item.typeId)
-                      const result = classifyItem(item, othersOf(item.id, source), zone)
+                      const result = classifyPlacement(item, othersOf(item.id, source), zone, room)
                       const isActive = activeId === item.id
-                      const moving = draggingId === item.id
-                      const showField =
-                        (isActive || moving) &&
-                        result.state !== 'outside' &&
-                        (result.state !== 'locked' || isActive)
+                      const moving = holding && session.preview.id === item.id
+                      const showField = moving || (isActive && (result.tone !== 'neutral' || result.state === 'locked'))
                       const outline = isActive ? 'outline-2 outline-accent' : 'outline outline-1 outline-transparent'
                       const fieldW = def.widthMm + def.clearanceMm.left + def.clearanceMm.right
                       const fieldH = def.depthMm + def.clearanceMm.front + def.clearanceMm.back
@@ -627,7 +771,7 @@ function App() {
                         <div key={item.id}>
                           {showField && (
                             <div
-                              className={`pointer-events-none absolute rounded-[18px] ${fieldClass(result)}`}
+                              className={`pointer-events-none absolute rounded-[18px] ${fieldToneClass(result.tone, moving)}`}
                               style={{
                                 left: mmToPercent(item.xMm - fieldW / 2, room.widthMm),
                                 top: mmToPercent(item.yMm - fieldH / 2, room.depthMm),
@@ -644,12 +788,13 @@ function App() {
                           )}
                           <div
                             className={`absolute z-[1] touch-none ${outline} ${
-                              item.locked ? 'cursor-pointer' : 'cursor-grab'
-                            } ${moving ? 'cursor-grabbing' : ''}`}
+                              item.locked ? 'cursor-pointer' : holding ? 'cursor-grabbing' : 'cursor-grab'
+                            }`}
                             role="button"
                             tabIndex={0}
-                            aria-label={`${instanceLabel(item, source)}${item.locked ? ', locked' : ''}`}
+                            aria-label={`${instanceLabel(item, source)}${item.locked ? ', locked' : moving ? ', held' : ''}`}
                             aria-pressed={isActive}
+                            data-furniture={item.id}
                             style={{
                               left: mmToPercent(item.xMm - def.widthMm / 2, room.widthMm),
                               top: mmToPercent(item.yMm - def.depthMm / 2, room.depthMm),
@@ -658,15 +803,13 @@ function App() {
                               transform: `rotate(${item.rotationDeg}deg)`,
                               transformOrigin: 'center center',
                               zIndex: moving || isActive ? 3 : 1,
+                              pointerEvents: moving ? 'none' : 'auto',
                               transition:
                                 moving || !animate
                                   ? 'none'
                                   : 'left 280ms ease, top 280ms ease, transform 280ms ease',
                             }}
-                            onPointerDown={(event) => onPointerDown(event, item.id)}
-                            onPointerMove={onPointerMove}
-                            onPointerUp={onPointerUp}
-                            onPointerCancel={onPointerUp}
+                            onPointerDown={(event) => onItemPointerDown(event, item.id)}
                           >
                             <CanvasShape typeId={item.typeId} />
                             <span className="pointer-events-none absolute inset-x-1 bottom-1 text-center text-[10px] leading-tight font-medium text-ink/70">
@@ -681,27 +824,6 @@ function App() {
                         </div>
                       )
                     })}
-
-                    {catalogDrag?.overRoom && (
-                      <div
-                        className="pointer-events-none absolute z-[4] rounded-[10px] outline outline-2 outline-dashed outline-accent/70"
-                        style={{
-                          left: mmToPercent(
-                            catalogDrag.xMm - definitionOf(catalogDrag.typeId).widthMm / 2,
-                            room.widthMm,
-                          ),
-                          top: mmToPercent(
-                            catalogDrag.yMm - definitionOf(catalogDrag.typeId).depthMm / 2,
-                            room.depthMm,
-                          ),
-                          width: mmToPercent(definitionOf(catalogDrag.typeId).widthMm, room.widthMm),
-                          height: mmToPercent(definitionOf(catalogDrag.typeId).depthMm, room.depthMm),
-                          opacity: 0.7,
-                        }}
-                      >
-                        <CanvasShape typeId={catalogDrag.typeId} />
-                      </div>
-                    )}
                   </div>
 
                   <div className="flex shrink-0 items-center justify-center" style={{ width: LABEL_SIDE_PX }} />
@@ -711,7 +833,10 @@ function App() {
           </div>
         </main>
 
-        <aside className="relative flex w-[300px] shrink-0 flex-col overflow-y-auto bg-panel px-5 py-4">
+        <aside
+          data-placement-chrome="true"
+          className="relative flex w-[300px] shrink-0 flex-col overflow-y-auto bg-panel px-5 py-4"
+        >
           <div className="pointer-events-none absolute inset-y-0 left-0 w-[6px] bg-oak/70" />
           <div
             className="pointer-events-none absolute inset-y-0 left-[6px] w-8"
@@ -725,10 +850,8 @@ function App() {
                 key={value}
                 type="button"
                 onClick={() => {
+                  if (sessionRef.current) cancelSession()
                   setMode(value)
-                  dragRef.current = null
-                  setDraggingId(null)
-                  setPreview(null)
                 }}
                 className={`rounded-[10px] px-3 py-1.5 text-[13px] font-medium ${
                   mode === value
@@ -754,9 +877,6 @@ function App() {
                   <div
                     className="flex w-full items-center gap-2.5 rounded-[12px] border border-line bg-panel px-2.5 py-2 text-left shadow-[inset_3px_0_0_0_#c4a574]"
                     onPointerDown={(event) => onCatalogPointerDown(event, def.typeId)}
-                    onPointerMove={onCatalogPointerMove}
-                    onPointerUp={onCatalogPointerUp}
-                    onPointerCancel={onCatalogPointerUp}
                   >
                     <div className="h-9 w-11 shrink-0 cursor-grab">
                       <FurnitureGlyph typeId={def.typeId} />
@@ -764,9 +884,7 @@ function App() {
                     <div className="min-w-0 flex-1">
                       <p className="text-[13px] font-medium">{def.name}</p>
                       <p className="text-[11px] text-muted">{formatMmSize(def)}</p>
-                      <p className="text-[11px] text-muted">
-                        {count} in scene
-                      </p>
+                      <p className="text-[11px] text-muted">{count} in scene</p>
                     </div>
                     <button
                       type="button"
@@ -793,15 +911,18 @@ function App() {
               <p className="text-[12px] text-muted">Angle {active.rotationDeg}°</p>
               <p
                 className={`mt-1.5 text-[12px] font-medium ${
-                  activeResult.state === 'inside-valid'
+                  activeResult.tone === 'valid'
                     ? 'text-valid'
-                    : activeResult.state === 'outside' || activeResult.state === 'locked'
+                    : activeResult.tone === 'neutral'
                       ? 'text-muted'
                       : 'text-conflict'
                 }`}
               >
-                {activeResult.reason}
+                {holding ? `${activeResult.reason} · ${activeResult.allowed ? 'click to place' : 'cannot place'}` : activeResult.reason}
               </p>
+              {holding && (
+                <p className="mt-1 text-[12px] text-muted">Q / E or R rotate 45°. Esc or right-click cancels.</p>
+              )}
               {activeResult.state === 'locked' && (
                 <p className="mt-1 text-[12px] text-muted">Unlock to transform this item</p>
               )}
@@ -809,7 +930,7 @@ function App() {
                 <button
                   type="button"
                   onClick={() => handleRotate(-45)}
-                  disabled={active.locked}
+                  disabled={!holding && active.locked}
                   className="rounded-[10px] border border-line bg-panel px-2 py-1.5 text-[12px] font-medium disabled:opacity-40"
                 >
                   Rotate −45°
@@ -817,7 +938,7 @@ function App() {
                 <button
                   type="button"
                   onClick={() => handleRotate(45)}
-                  disabled={active.locked}
+                  disabled={!holding && active.locked}
                   className="rounded-[10px] border border-line bg-panel px-2 py-1.5 text-[12px] font-medium disabled:opacity-40"
                 >
                   Rotate +45°
@@ -825,7 +946,7 @@ function App() {
                 <button
                   type="button"
                   onClick={handleLockToggle}
-                  disabled={!active.locked && !activeResult.canLock}
+                  disabled={holding || (!active.locked && activeResult.tone !== 'valid')}
                   title={!active.locked && lockReason ? lockReason : undefined}
                   className="rounded-[10px] border border-line bg-panel px-2 py-1.5 text-[12px] font-medium disabled:opacity-40"
                 >
@@ -834,7 +955,8 @@ function App() {
                 <button
                   type="button"
                   onClick={handleDuplicate}
-                  className="rounded-[10px] border border-line bg-panel px-2 py-1.5 text-[12px] font-medium"
+                  disabled={holding}
+                  className="rounded-[10px] border border-line bg-panel px-2 py-1.5 text-[12px] font-medium disabled:opacity-40"
                 >
                   Duplicate
                 </button>
@@ -848,72 +970,62 @@ function App() {
                 <button
                   type="button"
                   aria-pressed={active.includedInVariants}
-                  onClick={() => commitItem(active.id, { includedInVariants: !active.includedInVariants })}
-                  className={`rounded-[10px] border bg-panel px-2 py-1.5 text-[12px] font-medium ${
+                  disabled={holding && session?.source === 'catalog'}
+                  onClick={() => {
+                    if (session && session.preview.id === active.id) {
+                      writeSession({
+                        ...session,
+                        preview: { ...session.preview, includedInVariants: !session.preview.includedInVariants },
+                      })
+                      return
+                    }
+                    commitItem(active.id, { includedInVariants: !active.includedInVariants })
+                  }}
+                  className={`rounded-[10px] border bg-panel px-2 py-1.5 text-[12px] font-medium disabled:opacity-40 ${
                     active.includedInVariants ? 'border-accent' : 'border-line'
                   }`}
                 >
                   Include in Variants
                 </button>
               </div>
-              {!active.locked && lockReason && lockReason !== activeResult.reason && (
+              {!active.locked && lockReason && lockReason !== activeResult.reason && !holding && (
                 <p className="mt-1.5 text-[11px] text-muted">{lockReason}</p>
               )}
             </div>
           )}
 
           <div className="relative mt-4 rounded-[14px] border border-line bg-stone/40 px-3 py-3">
-            <h2 className="text-[11px] font-medium tracking-[0.08em] text-muted uppercase">Room Settings</h2>
+            <h2 className="text-[11px] font-medium tracking-[0.08em] text-muted uppercase">Active Area</h2>
             <div className="mt-2 flex flex-col gap-1.5">
               <NumberField
-                label="Width"
-                value={room.widthMm}
-                min={ROOM_WIDTH_MIN_MM}
-                max={ROOM_WIDTH_MAX_MM}
-                step={50}
-                onChange={(value) => applyRoom({ widthMm: value })}
-              />
-              <NumberField
-                label="Depth"
-                value={room.depthMm}
-                min={ROOM_DEPTH_MIN_MM}
-                max={ROOM_DEPTH_MAX_MM}
-                step={50}
-                onChange={(value) => applyRoom({ depthMm: value })}
-              />
-              <NumberField
-                label="Height"
-                value={room.heightMm}
-                min={ROOM_HEIGHT_MIN_MM}
-                max={ROOM_HEIGHT_MAX_MM}
-                step={DIMENSION_STEP_MM}
-                onChange={(value) => applyRoom({ heightMm: value })}
-              />
-              <NumberField
-                label="Lounge W"
+                label="Area Width"
                 value={zone.w}
-                min={ZONE_SIZE_MIN_MM}
-                max={room.widthMm}
+                min={AREA_SIZE_MIN_MM}
+                max={AREA_SIZE_MAX_MM}
                 step={DIMENSION_STEP_MM}
-                onChange={(value) => applyZoneSize(value, zone.h)}
+                onChange={(value) => applyAreaSize(value, zone.h)}
               />
               <NumberField
-                label="Lounge D"
+                label="Area Depth"
                 value={zone.h}
-                min={ZONE_SIZE_MIN_MM}
-                max={room.depthMm}
+                min={AREA_SIZE_MIN_MM}
+                max={AREA_SIZE_MAX_MM}
                 step={DIMENSION_STEP_MM}
-                onChange={(value) => applyZoneSize(zone.w, value)}
+                onChange={(value) => applyAreaSize(zone.w, value)}
               />
             </div>
-            <p className="mt-2 text-[11px] text-muted">Height is stored for a future 3D preview.</p>
+            <p className="mt-2 text-[11px] text-muted">
+              Staging room {room.widthMm} × {room.depthMm} × {room.heightMm} mm is derived from the Active Area and is not
+              editable. Ceiling height is for clay 3D guides, not 2D collision.
+            </p>
           </div>
 
           {mode === 'variants' && (
             <button
               type="button"
               onClick={handleGenerate}
-              className="mt-4 rounded-[12px] bg-accent px-4 py-2.5 text-[14px] font-medium text-panel shadow-[0_1px_0_rgba(40,35,31,0.16)] hover:bg-accent-dark"
+              disabled={holding}
+              className="mt-4 rounded-[12px] bg-accent px-4 py-2.5 text-[14px] font-medium text-panel shadow-[0_1px_0_rgba(40,35,31,0.16)] hover:bg-accent-dark disabled:opacity-40"
             >
               {variantIndex === 0 ? 'Generate Variant' : 'Try Another Variant'}
             </button>
@@ -921,9 +1033,20 @@ function App() {
 
           {mode === 'guided' && (
             <p className="mt-4 text-[12px] text-muted">
-              Drag freely in the room. Constraints apply inside the Lounge Zone. Rotate 45° or press R.
+              Pick up an object; it snaps to the 300 mm grid. Release on a valid cell to place. Invalid cells stay held.
+              Q / E or R rotate 45°. Ergonomic rules apply only inside the Active Area.
             </p>
           )}
+
+          <button
+            type="button"
+            onClick={() => setMakeRealOpen(true)}
+            disabled={makeRealDisabled}
+            title={makeRealReason}
+            className="mt-4 rounded-[12px] bg-walnut px-4 py-2.5 text-[14px] font-medium text-panel shadow-[0_1px_0_rgba(40,35,31,0.16)] disabled:opacity-40"
+          >
+            Make It Real
+          </button>
 
           <button
             type="button"
@@ -942,6 +1065,21 @@ function App() {
             {status?.kind === 'error' && (
               <p className="rounded-[12px] border border-conflict/25 bg-conflict/10 px-3 py-2 text-[12px] font-medium text-conflict">
                 {status.message}
+              </p>
+            )}
+            {status?.kind === 'info' && (
+              <p className="rounded-[12px] border border-line bg-stone/50 px-3 py-2 text-[12px] font-medium text-ink">
+                {status.message}
+              </p>
+            )}
+            {holding && !status && (
+              <p className="rounded-[12px] border border-line bg-stone/50 px-3 py-2 text-[12px] font-medium text-ink">
+                Holding object — click a valid grid cell to place
+              </p>
+            )}
+            {!layoutOk.ok && !holding && (
+              <p className="mt-2 rounded-[12px] border border-conflict/25 bg-conflict/10 px-3 py-2 text-[12px] font-medium text-conflict">
+                Layout is invalid ({layoutOk.reason}). Move or delete the conflicting object.
               </p>
             )}
           </div>
@@ -969,6 +1107,18 @@ function App() {
           </div>
         </aside>
       </div>
+
+      {makeRealOpen && (
+        <Suspense fallback={null}>
+          <MakeRealModal
+            room={room}
+            zone={zone}
+            instances={instances}
+            apiUrl={aiApiUrl}
+            onClose={() => setMakeRealOpen(false)}
+          />
+        </Suspense>
+      )}
     </div>
   )
 }

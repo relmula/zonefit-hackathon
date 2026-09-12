@@ -10,14 +10,16 @@ import {
 
 export const GRID_MM = 300
 export const MAX_INSTANCES = 12
-export const ROOM_WIDTH_MIN_MM = 3000
-export const ROOM_WIDTH_MAX_MM = 12000
-export const ROOM_DEPTH_MIN_MM = 3000
-export const ROOM_DEPTH_MAX_MM = 12000
-export const ROOM_HEIGHT_MIN_MM = 2400
-export const ROOM_HEIGHT_MAX_MM = 4500
 export const DIMENSION_STEP_MM = 100
-export const ZONE_SIZE_MIN_MM = 1200
+export const AREA_SIZE_MIN_MM = 1200
+export const AREA_SIZE_MAX_MM = 7200
+export const CEILING_MIN_MM = 2400
+export const CEILING_MAX_MM = 3600
+export const DEFAULT_AREA_WIDTH_MM = 3600
+export const DEFAULT_AREA_DEPTH_MM = 2700
+export const DEFAULT_AREA_HEIGHT_MM = 2800
+export const ROOM_FROM_AREA_RATIO = 5 / 3
+export const ZONE_SIZE_MIN_MM = AREA_SIZE_MIN_MM
 
 export type FurnitureTypeId = 'sofa' | 'chair' | 'coffee' | 'side'
 export type Rotation = 0 | 45 | 90 | 135 | 180 | 225 | 270 | 315
@@ -60,19 +62,55 @@ export type RoomSettings = {
 
 export const ROTATIONS: Rotation[] = [0, 45, 90, 135, 180, 225, 270, 315]
 export const CARDINAL_ROTATIONS: Rotation[] = [0, 90, 180, 270]
+export const SOFA_VARIANT_ROTATIONS: Rotation[] = [0, 180]
 
-export const DEFAULT_ROOM: RoomSettings = {
-  widthMm: 6000,
-  depthMm: 4500,
-  heightMm: 2800,
+export function clampDimension(value: number, min: number, max: number, step = DIMENSION_STEP_MM): number {
+  const rounded = Math.round(value / step) * step
+  return Math.min(max, Math.max(min, rounded))
 }
 
-export const DEFAULT_ZONE: RectMm = {
-  x: 600,
-  y: 600,
-  w: 3600,
-  h: 2700,
+export function clampAreaSize(widthMm: number, depthMm: number): { widthMm: number; depthMm: number } {
+  return {
+    widthMm: clampDimension(widthMm, AREA_SIZE_MIN_MM, AREA_SIZE_MAX_MM),
+    depthMm: clampDimension(depthMm, AREA_SIZE_MIN_MM, AREA_SIZE_MAX_MM),
+  }
 }
+
+/** Ceiling height scales with Active Area size; 3600 × 2700 mm yields 2800 mm. */
+export function deriveCeilingHeightMm(areaWidthMm: number, areaDepthMm: number): number {
+  const reference = Math.sqrt(DEFAULT_AREA_WIDTH_MM * DEFAULT_AREA_DEPTH_MM)
+  const raw = (Math.sqrt(areaWidthMm * areaDepthMm) / reference) * DEFAULT_AREA_HEIGHT_MM
+  return Math.min(CEILING_MAX_MM, Math.max(CEILING_MIN_MM, Math.round(raw)))
+}
+
+export function deriveRoomFromArea(areaWidthMm: number, areaDepthMm: number): RoomSettings {
+  const area = clampAreaSize(areaWidthMm, areaDepthMm)
+  return {
+    widthMm: Math.round(area.widthMm * ROOM_FROM_AREA_RATIO),
+    depthMm: Math.round(area.depthMm * ROOM_FROM_AREA_RATIO),
+    heightMm: deriveCeilingHeightMm(area.widthMm, area.depthMm),
+  }
+}
+
+export function centeredActiveArea(areaWidthMm: number, areaDepthMm: number, room: RoomSettings): RectMm {
+  const w = Math.min(room.widthMm, areaWidthMm)
+  const h = Math.min(room.depthMm, areaDepthMm)
+  return {
+    x: (room.widthMm - w) / 2,
+    y: (room.depthMm - h) / 2,
+    w,
+    h,
+  }
+}
+
+export function layoutFromArea(areaWidthMm: number, areaDepthMm: number): { room: RoomSettings; zone: RectMm } {
+  const area = clampAreaSize(areaWidthMm, areaDepthMm)
+  const room = deriveRoomFromArea(area.widthMm, area.depthMm)
+  return { room, zone: centeredActiveArea(area.widthMm, area.depthMm, room) }
+}
+
+export const DEFAULT_ROOM: RoomSettings = deriveRoomFromArea(DEFAULT_AREA_WIDTH_MM, DEFAULT_AREA_DEPTH_MM)
+export const DEFAULT_ZONE: RectMm = centeredActiveArea(DEFAULT_AREA_WIDTH_MM, DEFAULT_AREA_DEPTH_MM, DEFAULT_ROOM)
 
 function uniformClearance(mm: number): ClearanceMm {
   return { front: mm, back: mm, left: mm, right: mm }
@@ -165,20 +203,8 @@ export function roomRect(room: RoomSettings): RectMm {
   return { x: 0, y: 0, w: room.widthMm, h: room.depthMm }
 }
 
-export function clampDimension(value: number, min: number, max: number, step = DIMENSION_STEP_MM): number {
-  const rounded = Math.round(value / step) * step
-  return Math.min(max, Math.max(min, rounded))
-}
-
 export function centerZoneInRoom(room: RoomSettings, widthMm: number, depthMm: number): RectMm {
-  const w = Math.min(room.widthMm, Math.max(ZONE_SIZE_MIN_MM, widthMm))
-  const h = Math.min(room.depthMm, Math.max(ZONE_SIZE_MIN_MM, depthMm))
-  return {
-    x: (room.widthMm - w) / 2,
-    y: (room.depthMm - h) / 2,
-    w,
-    h,
-  }
+  return centeredActiveArea(widthMm, depthMm, room)
 }
 
 export function keepZoneInsideRoom(room: RoomSettings, zone: RectMm): RectMm {
@@ -292,12 +318,14 @@ export function createInitialInstances(): FurnitureInstance[] {
   const chair = FURNITURE_BY_TYPE.chair
   const coffee = FURNITURE_BY_TYPE.coffee
   const side = FURNITURE_BY_TYPE.side
+  const originX = DEFAULT_ZONE.x
+  const originY = DEFAULT_ZONE.y
   return [
     {
       id: 'sofa-1',
       typeId: 'sofa',
-      xMm: 900 + sofa.widthMm / 2,
-      yMm: 900 + sofa.depthMm / 2,
+      xMm: originX + 300 + sofa.widthMm / 2,
+      yMm: originY + 300 + sofa.depthMm / 2,
       rotationDeg: 0,
       locked: false,
       includedInVariants: true,
@@ -305,8 +333,8 @@ export function createInitialInstances(): FurnitureInstance[] {
     {
       id: 'chair-1',
       typeId: 'chair',
-      xMm: 3300 + chair.widthMm / 2,
-      yMm: 900 + chair.depthMm / 2,
+      xMm: originX + 2700 + chair.widthMm / 2,
+      yMm: originY + 300 + chair.depthMm / 2,
       rotationDeg: 0,
       locked: false,
       includedInVariants: true,
@@ -314,8 +342,8 @@ export function createInitialInstances(): FurnitureInstance[] {
     {
       id: 'coffee-1',
       typeId: 'coffee',
-      xMm: 1500 + coffee.widthMm / 2,
-      yMm: 2100 + coffee.depthMm / 2,
+      xMm: originX + 900 + coffee.widthMm / 2,
+      yMm: originY + 1500 + coffee.depthMm / 2,
       rotationDeg: 0,
       locked: false,
       includedInVariants: true,
@@ -323,8 +351,8 @@ export function createInitialInstances(): FurnitureInstance[] {
     {
       id: 'side-1',
       typeId: 'side',
-      xMm: 3300 + side.widthMm / 2,
-      yMm: 2100 + side.depthMm / 2,
+      xMm: originX + 2700 + side.widthMm / 2,
+      yMm: originY + 1500 + side.depthMm / 2,
       rotationDeg: 0,
       locked: false,
       includedInVariants: true,

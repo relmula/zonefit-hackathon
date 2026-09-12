@@ -30,7 +30,7 @@ export function validateItem(
   const assessment = classifyItem(unlocked, others, zone)
   if (assessment.state === 'inside-valid') return result([])
   if (assessment.state === 'outside') {
-    return result([{ code: 'outside-zone', reason: 'Outside the Lounge Zone' }])
+    return result([{ code: 'outside-zone', reason: 'Outside the Active Area' }])
   }
   return result(assessment.issues)
 }
