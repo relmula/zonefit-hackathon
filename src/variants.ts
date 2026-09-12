@@ -1,14 +1,17 @@
+import { polygonInsideRect } from './geometry'
 import {
   ALL_IDS,
   FURNITURE_BY_ID,
   GRID_MM,
   LOUNGE_ZONE,
+  ROTATIONS,
   centerOf,
   facingVector,
-  footprintOf,
+  footprintPolygon,
+  itemFitsRoom,
   layoutSignature,
-  positionKey,
-  rotatedSize,
+  orientationAxis,
+  rotationForFacing,
   widthVector,
   type FurnitureId,
   type PlacedItem,
@@ -25,13 +28,18 @@ export type VariantResult =
 
 type Edge = 'top' | 'right' | 'bottom' | 'left'
 type Side = -1 | 1
+type ChairMode = 'left' | 'right' | 'opposite' | 'angled-left' | 'angled-right'
 
 const EDGES: Edge[] = ['top', 'right', 'bottom', 'left']
-const ALONG = [0.32, 0.42, 0.5, 0.58, 0.68]
-const INSETS = [0, GRID_MM]
-const GAPS = [GRID_MM * 2, GRID_MM * 3]
-const MAX_LAYOUTS = 720
-const TOP_PICKS = 8
+const ALONG = [0.18, 0.32, 0.5, 0.68, 0.82]
+const INSETS = [0, GRID_MM, GRID_MM * 2]
+const GAPS = [0, GRID_MM]
+const COFFEE_SLIDES = [0, -GRID_MM, GRID_MM]
+const MAX_LAYOUTS = 900
+const TOP_PICKS = 10
+const SOFA_MOVE_MM = 600
+const OTHER_MOVE_MM = 500
+const CARDINAL: Rotation[] = [0, 90, 180, 270]
 
 const EDGE_ROTATION: Record<Edge, Rotation> = {
   top: 0,
@@ -44,31 +52,52 @@ function cloneItem(item: PlacedItem): PlacedItem {
   return { ...item }
 }
 
-function rotationForFacing(target: PointMm): Rotation {
-  const options: Rotation[] = [0, 90, 180, 270]
-  const found = options.find((rotation) => {
-    const vector = facingVector(rotation)
-    return vector.x === target.x && vector.y === target.y
-  })
-  return found ?? 0
-}
-
-function sizeAlong(size: { w: number; h: number }, axis: PointMm): number {
-  return Math.abs(axis.x) * size.w + Math.abs(axis.y) * size.h
-}
-
-function originFromCenter(center: PointMm, size: { w: number; h: number }): PointMm {
-  return snapPoint({
-    x: center.x - size.w / 2,
-    y: center.y - size.h / 2,
-  })
-}
-
 function addScaled(origin: PointMm, axis: PointMm, distance: number): PointMm {
   return {
     x: origin.x + axis.x * distance,
     y: origin.y + axis.y * distance,
   }
+}
+
+function normalize(vector: PointMm): PointMm {
+  const length = Math.hypot(vector.x, vector.y) || 1
+  return { x: vector.x / length, y: vector.y / length }
+}
+
+function halfExtent(item: PlacedItem, axis: PointMm): number {
+  const poly = footprintPolygon(item)
+  const center = centerOf(item)
+  let max = 0
+  for (const point of poly) {
+    const depth = Math.abs((point.x - center.x) * axis.x + (point.y - center.y) * axis.y)
+    if (depth > max) max = depth
+  }
+  return max
+}
+
+function snapPlaced(item: PlacedItem): PlacedItem {
+  const extX = halfExtent(item, { x: 1, y: 0 })
+  const extY = halfExtent(item, { x: 0, y: 1 })
+  const minX = Math.ceil((LOUNGE_ZONE.x + extX) / GRID_MM) * GRID_MM
+  const maxX = Math.floor((LOUNGE_ZONE.x + LOUNGE_ZONE.w - extX) / GRID_MM) * GRID_MM
+  const minY = Math.ceil((LOUNGE_ZONE.y + extY) / GRID_MM) * GRID_MM
+  const maxY = Math.floor((LOUNGE_ZONE.y + LOUNGE_ZONE.h - extY) / GRID_MM) * GRID_MM
+  const snapped = snapPoint({ x: item.x, y: item.y })
+  const x = Math.min(maxX, Math.max(minX, snapped.x))
+  const y = Math.min(maxY, Math.max(minY, snapped.y))
+  return { ...item, x, y }
+}
+
+function isInsideZone(item: PlacedItem): boolean {
+  return polygonInsideRect(footprintPolygon(item), LOUNGE_ZONE) && itemFitsRoom(item)
+}
+
+function requiredGap(a: FurnitureId, b: FurnitureId): number {
+  return Math.max(FURNITURE_BY_ID[a].clearance, FURNITURE_BY_ID[b].clearance)
+}
+
+function placeRelative(id: FurnitureId, rotation: Rotation, center: PointMm, locked: boolean): PlacedItem {
+  return snapPlaced({ id, x: center.x, y: center.y, rotation, locked })
 }
 
 function placeOnEdge(
@@ -78,111 +107,174 @@ function placeOnEdge(
   inset: number,
   locked: boolean,
 ): PlacedItem {
-  const def = FURNITURE_BY_ID[id]
   const rotation = EDGE_ROTATION[edge]
-  const size = rotatedSize(def, rotation)
+  const probe = { id, x: 0, y: 0, rotation, locked }
+  const extX = halfExtent(probe, { x: 1, y: 0 })
+  const extY = halfExtent(probe, { x: 0, y: 1 })
   const zone = LOUNGE_ZONE
-  let x = zone.x
-  let y = zone.y
+  let x = zone.x + zone.w / 2
+  let y = zone.y + zone.h / 2
 
   if (edge === 'top' || edge === 'bottom') {
-    const span = Math.max(0, zone.w - size.w)
-    x = zone.x + span * alongT
-    y = edge === 'top' ? zone.y + inset : zone.y + zone.h - size.h - inset
+    const minX = zone.x + extX
+    const maxX = zone.x + zone.w - extX
+    x = minX + Math.max(0, maxX - minX) * alongT
+    y = edge === 'top' ? zone.y + inset + extY : zone.y + zone.h - inset - extY
   } else {
-    const span = Math.max(0, zone.h - size.h)
-    y = zone.y + span * alongT
-    x = edge === 'left' ? zone.x + inset : zone.x + zone.w - size.w - inset
+    const minY = zone.y + extY
+    const maxY = zone.y + zone.h - extY
+    y = minY + Math.max(0, maxY - minY) * alongT
+    x = edge === 'left' ? zone.x + inset + extX : zone.x + zone.w - inset - extX
   }
 
-  const snapped = snapPoint({ x, y })
-  return { id, x: snapped.x, y: snapped.y, rotation, locked }
+  return snapPlaced({ id, x, y, rotation, locked })
 }
 
-function placeRelative(
-  id: FurnitureId,
-  rotation: Rotation,
-  center: PointMm,
-  locked: boolean,
-): PlacedItem {
-  const size = rotatedSize(FURNITURE_BY_ID[id], rotation)
-  const origin = originFromCenter(center, size)
-  return { id, x: origin.x, y: origin.y, rotation, locked }
-}
-
-function coffeeInFront(sofa: PlacedItem, gap: number): PlacedItem {
+function coffeeInFront(sofa: PlacedItem, extra: number, slide: number): PlacedItem {
   const face = facingVector(sofa.rotation)
-  const sofaSize = footprintOf(sofa)
-  const coffeeSize = rotatedSize(FURNITURE_BY_ID.coffee, sofa.rotation)
-  const separation = Math.max(gap, FURNITURE_BY_ID.sofa.clearance, FURNITURE_BY_ID.coffee.clearance)
-  const distance =
-    sizeAlong(sofaSize, face) / 2 + separation + sizeAlong(coffeeSize, face) / 2
-  const center = addScaled(centerOf(sofa), face, distance)
+  const width = widthVector(sofa.rotation)
+  const coffee: PlacedItem = { id: 'coffee', x: sofa.x, y: sofa.y, rotation: sofa.rotation, locked: false }
+  const distance = halfExtent(sofa, face) + requiredGap('sofa', 'coffee') + extra + halfExtent(coffee, face)
+  const center = addScaled(addScaled(centerOf(sofa), face, distance), width, slide)
   return placeRelative('coffee', sofa.rotation, center, false)
 }
 
-function chairBeside(sofa: PlacedItem, side: Side, gap: number): PlacedItem {
+function chairBeside(sofa: PlacedItem, side: Side): PlacedItem {
   const face = facingVector(sofa.rotation)
   const width = widthVector(sofa.rotation)
-  const sofaSize = footprintOf(sofa)
-  const chairSize = rotatedSize(FURNITURE_BY_ID.chair, 0)
-  const distance =
-    sizeAlong(sofaSize, width) / 2 + gap + sizeAlong(chairSize, width) / 2
-  const center = addScaled(
-    addScaled(centerOf(sofa), width, side * distance),
-    face,
-    GRID_MM,
-  )
+  const chair: PlacedItem = { id: 'chair', x: sofa.x, y: sofa.y, rotation: 0, locked: false }
+  const distance = halfExtent(sofa, width) + requiredGap('sofa', 'chair') + halfExtent(chair, width)
+  const center = addScaled(addScaled(centerOf(sofa), width, side * distance), face, GRID_MM)
   const rotation = rotationForFacing({ x: -side * width.x, y: -side * width.y })
   return placeRelative('chair', rotation, center, false)
 }
 
-function chairOpposite(sofa: PlacedItem, gap: number): PlacedItem {
+function chairBesideCoffee(sofa: PlacedItem, coffee: PlacedItem, side: Side): PlacedItem {
+  const width = widthVector(sofa.rotation)
   const face = facingVector(sofa.rotation)
-  const sofaSize = footprintOf(sofa)
-  const chairSize = rotatedSize(FURNITURE_BY_ID.chair, 0)
-  const distance =
-    sizeAlong(sofaSize, face) / 2 + gap + 800 + sizeAlong(chairSize, face) / 2
+  const chair: PlacedItem = { id: 'chair', x: coffee.x, y: coffee.y, rotation: 0, locked: false }
+  const distance = halfExtent(coffee, width) + requiredGap('coffee', 'chair') + halfExtent(chair, width)
+  const center = addScaled(centerOf(coffee), width, side * distance)
+  const rotation = rotationForFacing({ x: -face.x, y: -face.y })
+  return placeRelative('chair', rotation, center, false)
+}
+
+function chairOpposite(sofa: PlacedItem, extra: number): PlacedItem {
+  const face = facingVector(sofa.rotation)
+  const chair: PlacedItem = { id: 'chair', x: sofa.x, y: sofa.y, rotation: 0, locked: false }
+  const coffeeProbe: PlacedItem = { id: 'coffee', x: sofa.x, y: sofa.y, rotation: sofa.rotation, locked: false }
+  const coffeeSpan =
+    halfExtent(sofa, face) +
+    requiredGap('sofa', 'coffee') +
+    extra +
+    halfExtent(coffeeProbe, face) * 2 +
+    requiredGap('coffee', 'chair')
+  const distance = coffeeSpan + halfExtent(chair, face)
   const center = addScaled(centerOf(sofa), face, distance)
   const rotation = rotationForFacing({ x: -face.x, y: -face.y })
   return placeRelative('chair', rotation, center, false)
 }
 
-function sideBeside(anchor: PlacedItem, side: Side, gap: number): PlacedItem {
+function chairAngled(sofa: PlacedItem, side: Side): PlacedItem {
+  const face = facingVector(sofa.rotation)
+  const width = widthVector(sofa.rotation)
+  const dir = normalize({ x: width.x * side + face.x * 1.2, y: width.y * side + face.y * 1.2 })
+  const chair: PlacedItem = { id: 'chair', x: sofa.x, y: sofa.y, rotation: 45, locked: false }
+  const distance = halfExtent(sofa, dir) + requiredGap('sofa', 'chair') + halfExtent(chair, dir)
+  const center = addScaled(centerOf(sofa), dir, distance)
+  const rotation = rotationForFacing({ x: -dir.x, y: -dir.y })
+  return placeRelative('chair', rotation, center, false)
+}
+
+function sideBeside(anchor: PlacedItem, side: Side): PlacedItem {
   const face = facingVector(anchor.rotation)
   const width = widthVector(anchor.rotation)
-  const anchorSize = footprintOf(anchor)
-  const tableSize = rotatedSize(FURNITURE_BY_ID.side, 0)
-  const distance =
-    sizeAlong(anchorSize, width) / 2 + gap + sizeAlong(tableSize, width) / 2
+  const table: PlacedItem = { id: 'side', x: anchor.x, y: anchor.y, rotation: anchor.rotation, locked: false }
+  const distance = halfExtent(anchor, width) + requiredGap(anchor.id, 'side') + halfExtent(table, width)
   const center = addScaled(
     addScaled(centerOf(anchor), width, side * distance),
     face,
-    tableSize.h / 2,
+    -halfExtent(anchor, face) + halfExtent(table, face) + GRID_MM,
   )
   return placeRelative('side', anchor.rotation, center, false)
+}
+
+function sofaAnchorEdge(item: PlacedItem): Edge {
+  const zone = LOUNGE_ZONE
+  const ranked: { edge: Edge; d: number }[] = [
+    { edge: 'top', d: item.y - zone.y },
+    { edge: 'bottom', d: zone.y + zone.h - item.y },
+    { edge: 'left', d: item.x - zone.x },
+    { edge: 'right', d: zone.x + zone.w - item.x },
+  ]
+  ranked.sort((a, b) => a.d - b.d)
+  return ranked[0].edge
+}
+
+function relativeSlot(origin: PlacedItem, other: PlacedItem): string {
+  const dx = other.x - origin.x
+  const dy = other.y - origin.y
+  const sx = Math.abs(dx) < 250 ? 0 : dx < 0 ? -1 : 1
+  const sy = Math.abs(dy) < 250 ? 0 : dy < 0 ? -1 : 1
+  return `${sx}:${sy}`
+}
+
+export function compositionTopology(items: readonly PlacedItem[]): string {
+  const byId = new Map(items.map((item) => [item.id, item]))
+  const sofa = byId.get('sofa')
+  const chair = byId.get('chair')
+  const coffee = byId.get('coffee')
+  const side = byId.get('side')
+  if (!sofa) {
+    return `no-sofa:${chair ? sofaAnchorEdge(chair) : 'none'}`
+  }
+  const parts = [`edge:${sofaAnchorEdge(sofa)}`, `axis:${orientationAxis(sofa.rotation)}`]
+  if (chair) parts.push(`chair:${relativeSlot(sofa, chair)}`)
+  if (coffee) parts.push(`coffee:${relativeSlot(sofa, coffee)}`)
+  if (side) parts.push(`side:${relativeSlot(sofa, side)}`)
+  return parts.join('|')
+}
+
+export function isMeaningfullyDifferent(a: readonly PlacedItem[], b: readonly PlacedItem[]): boolean {
+  const byA = new Map(a.map((item) => [item.id, item]))
+  const byB = new Map(b.map((item) => [item.id, item]))
+  const sofaA = byA.get('sofa')
+  const sofaB = byB.get('sofa')
+
+  if (sofaA && sofaB) {
+    if (Math.hypot(sofaA.x - sofaB.x, sofaA.y - sofaB.y) >= SOFA_MOVE_MM) return true
+    if (orientationAxis(sofaA.rotation) !== orientationAxis(sofaB.rotation)) return true
+    if (sofaAnchorEdge(sofaA) !== sofaAnchorEdge(sofaB)) return true
+  }
+
+  if (compositionTopology(a) !== compositionTopology(b)) return true
+
+  let moved = 0
+  for (const id of ALL_IDS) {
+    if (id === 'sofa') continue
+    const left = byA.get(id)
+    const right = byB.get(id)
+    if (!left || !right) continue
+    if (Math.hypot(left.x - right.x, left.y - right.y) >= OTHER_MOVE_MM) moved += 1
+  }
+  return moved >= 2
 }
 
 function groupCentroid(items: PlacedItem[]): PointMm {
   const count = Math.max(1, items.length)
   return items.reduce(
-    (sum, item) => {
-      const center = centerOf(item)
-      return { x: sum.x + center.x / count, y: sum.y + center.y / count }
-    },
+    (sum, item) => ({ x: sum.x + item.x / count, y: sum.y + item.y / count }),
     { x: 0, y: 0 },
   )
 }
 
 function distanceBetween(a: PlacedItem, b: PlacedItem): number {
-  const ca = centerOf(a)
-  const cb = centerOf(b)
-  return Math.hypot(ca.x - cb.x, ca.y - cb.y)
+  return Math.hypot(a.x - b.x, a.y - b.y)
 }
 
 function scoreLayout(
   items: PlacedItem[],
-  currentSignature: string,
+  current: readonly PlacedItem[],
   recent: readonly string[],
 ): number {
   const byId = new Map(items.map((item) => [item.id, item]))
@@ -195,35 +287,28 @@ function scoreLayout(
   const centroid = groupCentroid(items)
   let score = 0
 
-  score -= Math.hypot(centroid.x - zoneCx, centroid.y - zoneCy) / 8
-
-  const upperLeft = items.filter(
-    (item) => item.x <= LOUNGE_ZONE.x + GRID_MM && item.y <= LOUNGE_ZONE.y + GRID_MM,
-  ).length
-  score -= upperLeft * 500
+  score -= Math.hypot(centroid.x - zoneCx, centroid.y - zoneCy) / 10
 
   if (sofa) {
-    const distLeft = sofa.x - LOUNGE_ZONE.x
-    const distTop = sofa.y - LOUNGE_ZONE.y
-    const distRight = LOUNGE_ZONE.x + LOUNGE_ZONE.w - (sofa.x + footprintOf(sofa).w)
-    const distBottom = LOUNGE_ZONE.y + LOUNGE_ZONE.h - (sofa.y + footprintOf(sofa).h)
-    const edgeDist = Math.min(distLeft, distTop, distRight, distBottom)
-    score += edgeDist < GRID_MM * 2 ? 220 : 40
-    if (distLeft <= GRID_MM && distTop <= GRID_MM) score -= 350
+    const currentSofa = current.find((item) => item.id === 'sofa')
+    if (currentSofa) {
+      const sofaMove = Math.hypot(sofa.x - currentSofa.x, sofa.y - currentSofa.y)
+      score += Math.min(sofaMove, 1800) / 4
+      if (orientationAxis(sofa.rotation) !== orientationAxis(currentSofa.rotation)) score += 220
+      if (sofaAnchorEdge(sofa) !== sofaAnchorEdge(currentSofa)) score += 260
+      if (sofaMove < 250 && orientationAxis(sofa.rotation) === orientationAxis(currentSofa.rotation)) {
+        score -= 500
+      }
+    }
+    score += 80
   }
 
   if (sofa && coffee) {
     const face = facingVector(sofa.rotation)
-    const sofaCenter = centerOf(sofa)
-    const coffeeCenter = centerOf(coffee)
-    const ahead =
-      (coffeeCenter.x - sofaCenter.x) * face.x + (coffeeCenter.y - sofaCenter.y) * face.y
+    const ahead = (coffee.x - sofa.x) * face.x + (coffee.y - sofa.y) * face.y
     const dist = distanceBetween(sofa, coffee)
     if (ahead > 0) score += 260
     if (dist >= 900 && dist <= 1800) score += 180
-    if (coffee.rotation === sofa.rotation || coffee.rotation === ((sofa.rotation + 180) % 360) as Rotation) {
-      score += 80
-    }
   }
 
   if (sofa && chair) {
@@ -240,60 +325,81 @@ function scoreLayout(
     }
   }
 
+  if (compositionTopology(items) !== compositionTopology(current)) score += 200
+
   const signature = layoutSignature(items)
-  if (signature === currentSignature) score -= 800
+  if (signature === layoutSignature(current)) score -= 800
   if (recent.includes(signature)) score -= 1000
 
   return score
 }
 
 function canAdd(item: PlacedItem, placed: PlacedItem[]): boolean {
+  if (!isInsideZone(item)) return false
   return validateItem(item, placed).ok
 }
 
-const ROTATIONS: Rotation[] = [0, 90, 180, 270]
+function tryPlace(item: PlacedItem, placed: PlacedItem[]): PlacedItem | null {
+  const offsets = [0, GRID_MM, -GRID_MM, GRID_MM * 2, -GRID_MM * 2]
+  for (const dy of offsets) {
+    for (const dx of offsets) {
+      const candidate = snapPlaced({ ...item, x: item.x + dx, y: item.y + dy })
+      if (canAdd(candidate, placed)) return candidate
+    }
+  }
+  return null
+}
+
 const REMAINING_ORDER: FurnitureId[] = ['sofa', 'coffee', 'chair', 'side']
 const FALLBACK_BRANCH = 8
 const FALLBACK_MAX_LAYOUTS = 96
 const FALLBACK_MAX_NODES = 2200
 
-function gridOrigins(size: { w: number; h: number }): PointMm[] {
+function gridCenters(id: FurnitureId, rotation: Rotation): PointMm[] {
   const points: PointMm[] = []
-  const maxX = LOUNGE_ZONE.x + LOUNGE_ZONE.w
-  const maxY = LOUNGE_ZONE.y + LOUNGE_ZONE.h
-  for (let y = LOUNGE_ZONE.y; y + size.h <= maxY; y += GRID_MM) {
-    for (let x = LOUNGE_ZONE.x; x + size.w <= maxX; x += GRID_MM) {
-      points.push({ x, y })
+  const probe: PlacedItem = { id, x: 0, y: 0, rotation, locked: false }
+  const extX = halfExtent(probe, { x: 1, y: 0 })
+  const extY = halfExtent(probe, { x: 0, y: 1 })
+  const minX = LOUNGE_ZONE.x + extX
+  const minY = LOUNGE_ZONE.y + extY
+  const maxX = LOUNGE_ZONE.x + LOUNGE_ZONE.w - extX
+  const maxY = LOUNGE_ZONE.y + LOUNGE_ZONE.h - extY
+  for (let y = snapPoint({ x: minX, y: minY }).y; y <= maxY + 0.5; y += GRID_MM) {
+    for (let x = snapPoint({ x: minX, y: minY }).x; x <= maxX + 0.5; x += GRID_MM) {
+      const item: PlacedItem = { id, x, y, rotation, locked: false }
+      if (isInsideZone(item)) points.push({ x, y })
     }
   }
   return points
 }
 
 function fallbackFill(
-  selected: readonly FurnitureId[],
-  locked: PlacedItem[],
+  remaining: FurnitureId[],
+  fixtures: PlacedItem[],
   rng: () => number,
   layouts: PlacedItem[][],
 ): void {
-  const remaining = REMAINING_ORDER.filter(
-    (id) => selected.includes(id) && !locked.some((item) => item.id === id),
-  )
   let nodes = 0
 
   const search = (index: number, placed: PlacedItem[]) => {
     if (layouts.length >= FALLBACK_MAX_LAYOUTS || nodes > FALLBACK_MAX_NODES) return
     if (index === remaining.length) {
-      if (placed.length === selected.length && validateLayout(placed).ok) {
-        layouts.push(placed.map(cloneItem))
-      }
+      const generated = placed.filter((item) => remaining.includes(item.id))
+      const valid = generated.every((item) =>
+        validateItem(
+          item,
+          placed.filter((other) => other.id !== item.id),
+        ).ok,
+      )
+      if (valid) layouts.push(placed.map(cloneItem))
       return
     }
 
     const id = remaining[index]
     const options: PlacedItem[] = []
-    for (const rotation of ROTATIONS) {
-      const size = rotatedSize(FURNITURE_BY_ID[id], rotation)
-      for (const pos of gridOrigins(size)) {
+    const rotations = id === 'chair' ? ROTATIONS : CARDINAL
+    for (const rotation of rotations) {
+      for (const pos of gridCenters(id, rotation)) {
         const item: PlacedItem = { id, x: pos.x, y: pos.y, rotation, locked: false }
         if (canAdd(item, placed)) options.push(item)
       }
@@ -301,41 +407,65 @@ function fallbackFill(
     if (options.length === 0) return
 
     shuffleInPlace(options, rng)
-    options.sort((a, b) => scoreLayout([...placed, b], '', []) - scoreLayout([...placed, a], '', []))
-    const best = options.slice(0, 3)
-    const rest = options.slice(3)
-    shuffleInPlace(rest, rng)
-    const branch = [...best, ...rest.slice(0, FALLBACK_BRANCH - best.length)]
+    const branch: PlacedItem[] = []
+    if (id === 'sofa') {
+      for (const edge of EDGES) {
+        const match = options.find((item) => sofaAnchorEdge(item) === edge)
+        if (match) branch.push(match)
+      }
+    }
+    options.sort((a, b) => scoreLayout([...placed, b], [], []) - scoreLayout([...placed, a], [], []))
+    for (const item of [...options.slice(0, 3), ...options]) {
+      if (branch.length >= FALLBACK_BRANCH) break
+      if (!branch.some((seen) => seen.x === item.x && seen.y === item.y && seen.rotation === item.rotation)) {
+        branch.push(item)
+      }
+    }
     for (const item of branch) {
       nodes += 1
       search(index + 1, [...placed, item])
     }
   }
 
-  search(0, locked.map(cloneItem))
+  search(0, fixtures.map(cloneItem))
+}
+
+function composeScene(
+  current: Record<FurnitureId, PlacedItem>,
+  placed: PlacedItem[],
+): PlacedItem[] {
+  const byId = new Map(placed.map((item) => [item.id, item]))
+  return ALL_IDS.map((id) => cloneItem(byId.get(id) ?? current[id]))
 }
 
 function buildLayouts(
-  selected: readonly FurnitureId[],
+  included: readonly FurnitureId[],
   current: Record<FurnitureId, PlacedItem>,
   rng: () => number,
 ): PlacedItem[][] {
-  const selectedSet = new Set(selected)
-  const locked = ALL_IDS.filter((id) => selectedSet.has(id) && current[id].locked).map((id) =>
+  const includedSet = new Set(included)
+  const fixtures = ALL_IDS.filter((id) => current[id].locked || !includedSet.has(id)).map((id) =>
     cloneItem(current[id]),
+  )
+  const remaining = REMAINING_ORDER.filter(
+    (id) => includedSet.has(id) && !current[id].locked,
   )
 
   const layouts: PlacedItem[][] = []
   const edges = shuffleInPlace([...EDGES], rng)
   const alongs = shuffleInPlace([...ALONG], rng)
   const insets = shuffleInPlace([...INSETS], rng)
-  const chairModes = shuffleInPlace(['left', 'right', 'opposite'] as const, rng)
+  const chairModes = shuffleInPlace(
+    ['left', 'right', 'opposite', 'angled-left', 'angled-right'] as ChairMode[],
+    rng,
+  )
   const sideAnchors = shuffleInPlace(['sofa', 'chair'] as const, rng)
   const sideSides = shuffleInPlace([-1, 1] as Side[], rng)
   const gaps = shuffleInPlace([...GAPS], rng)
+  const slides = shuffleInPlace([...COFFEE_SLIDES], rng)
 
-  const sofaLocked = selectedSet.has('sofa') && current.sofa.locked
-  const needsSofa = selectedSet.has('sofa') && !sofaLocked
+  const needsSofa = remaining.includes('sofa')
+  const sofaLocked = includedSet.has('sofa') && current.sofa.locked
 
   const sofaSeeds: PlacedItem[] = sofaLocked
     ? [cloneItem(current.sofa)]
@@ -345,14 +475,16 @@ function buildLayouts(
             insets.map((inset) => placeOnEdge('sofa', edge, along, inset, false)),
           ),
         )
-      : []
+      : fixtures.filter((item) => item.id === 'sofa')
 
-  if (!selectedSet.has('sofa')) {
+  if (!includedSet.has('sofa') && remaining.includes('chair')) {
     sofaSeeds.push(
-      ...edges.flatMap((edge) =>
-        alongs.map((along) => placeOnEdge('chair', edge, along, 0, false)),
-      ),
+      ...edges.flatMap((edge) => alongs.map((along) => placeOnEdge('chair', edge, along, 0, false))),
     )
+  }
+
+  if (sofaSeeds.length === 0 && remaining.length > 0) {
+    sofaSeeds.push(cloneItem(current[remaining[0]]))
   }
 
   outer: for (const sofaSeed of sofaSeeds) {
@@ -360,44 +492,64 @@ function buildLayouts(
       for (const chairMode of chairModes) {
         for (const sideAnchor of sideAnchors) {
           for (const sideSide of sideSides) {
-            const placed: PlacedItem[] = locked.map(cloneItem)
-            const used = new Set(placed.map((item) => item.id))
+            for (const slide of slides) {
+              const placed: PlacedItem[] = fixtures.map(cloneItem)
+              const used = new Set(placed.map((item) => item.id))
 
-            const add = (item: PlacedItem | null, required: boolean): boolean => {
-              if (!item || !selectedSet.has(item.id) || used.has(item.id)) return !required
-              if (!canAdd(item, placed)) return false
-              placed.push(item)
-              used.add(item.id)
-              return true
+              const add = (item: PlacedItem | null, required: boolean): boolean => {
+                if (!item || !includedSet.has(item.id) || used.has(item.id)) return !required
+                const placedItem = tryPlace(item, placed)
+                if (!placedItem) return false
+                placed.push(placedItem)
+                used.add(placedItem.id)
+                return true
+              }
+
+              if (needsSofa && !used.has('sofa')) {
+                if (sofaSeed.id !== 'sofa' || !add({ ...sofaSeed, id: 'sofa', locked: false }, true)) {
+                  continue
+                }
+              }
+
+              const sofa =
+                placed.find((item) => item.id === 'sofa') ??
+                (sofaSeed.id === 'sofa' ? sofaSeed : null)
+
+              if (remaining.includes('coffee') && !used.has('coffee') && sofa) {
+                if (!add(coffeeInFront(sofa, gap, slide), true)) continue
+              }
+
+              if (remaining.includes('chair') && !used.has('chair')) {
+                if (sofa) {
+                  const coffee = placed.find((item) => item.id === 'coffee')
+                  let chair: PlacedItem
+                  if (chairMode === 'opposite') chair = chairOpposite(sofa, gap)
+                  else if (chairMode === 'angled-left') chair = chairAngled(sofa, -1)
+                  else if (chairMode === 'angled-right') chair = chairAngled(sofa, 1)
+                  else if (coffee) chair = chairBesideCoffee(sofa, coffee, chairMode === 'left' ? -1 : 1)
+                  else chair = chairBeside(sofa, chairMode === 'left' ? -1 : 1)
+                  if (!add(chair, true)) continue
+                } else if (sofaSeed.id === 'chair') {
+                  if (!add({ ...sofaSeed, locked: false }, true)) continue
+                }
+              }
+
+              if (remaining.includes('side') && !used.has('side')) {
+                const anchorId = sideAnchor === 'chair' && used.has('chair') ? 'chair' : 'sofa'
+                const anchor = placed.find((item) => item.id === anchorId) ?? sofa
+                if (!anchor || !add(sideBeside(anchor, sideSide), true)) continue
+              }
+
+              if (remaining.some((id) => !used.has(id))) continue
+              const generated = placed.filter((item) => remaining.includes(item.id))
+              if (!validateLayout(generated).ok) continue
+              if (generated.some((item) => !canAdd(item, placed.filter((other) => other.id !== item.id)))) {
+                continue
+              }
+
+              layouts.push(placed.map(cloneItem))
+              if (layouts.length >= MAX_LAYOUTS) break outer
             }
-
-            if (selectedSet.has('sofa') && !used.has('sofa')) {
-              if (!add({ ...sofaSeed, id: 'sofa', locked: false }, true)) continue
-            }
-
-            const sofa = placed.find((item) => item.id === 'sofa') ?? (sofaSeed.id === 'sofa' ? sofaSeed : null)
-
-            if (selectedSet.has('coffee') && !used.has('coffee') && sofa) {
-              if (!add(coffeeInFront(sofa, gap), true)) continue
-            }
-
-            if (selectedSet.has('chair') && !used.has('chair') && sofa) {
-              const chair =
-                chairMode === 'opposite' ? chairOpposite(sofa, gap) : chairBeside(sofa, chairMode === 'left' ? -1 : 1, gap)
-              if (!add(chair, true)) continue
-            }
-
-            if (selectedSet.has('side') && !used.has('side')) {
-              const anchorId = sideAnchor === 'chair' && used.has('chair') ? 'chair' : 'sofa'
-              const anchor = placed.find((item) => item.id === anchorId) ?? sofa
-              if (!anchor || !add(sideBeside(anchor, sideSide, GRID_MM), true)) continue
-            }
-
-            if (placed.length !== selected.length) continue
-            if (!validateLayout(placed).ok) continue
-
-            layouts.push(placed)
-            if (layouts.length >= MAX_LAYOUTS) break outer
           }
         }
       }
@@ -405,64 +557,73 @@ function buildLayouts(
   }
 
   if (layouts.length < 24) {
-    fallbackFill(selected, locked, rng, layouts)
+    fallbackFill(remaining, fixtures, rng, layouts)
   }
 
   return layouts
 }
 
 export function generateVariant(
-  selected: readonly FurnitureId[],
+  included: readonly FurnitureId[],
   current: Record<FurnitureId, PlacedItem>,
   recentSignatures: readonly string[],
   seed: number,
 ): VariantResult {
-  if (selected.length === 0) {
+  if (included.length === 0) {
     return {
       ok: false,
-      message: 'Select at least one furniture piece to generate a variant.',
+      message: 'Include at least one furniture piece to generate a variant.',
     }
   }
 
-  const unlocked = selected.filter((id) => !current[id].locked)
+  const unlocked = included.filter((id) => !current[id].locked)
   if (unlocked.length === 0) {
     return {
       ok: false,
-      message: 'Unlock at least one furniture piece to generate a variant.',
+      message: 'Unlock at least one included furniture piece to generate a variant.',
     }
   }
 
-  const lockedItems = selected.filter((id) => current[id].locked).map((id) => current[id])
-  const lockedCheck = validateLayout(lockedItems)
-  if (!lockedCheck.ok) {
-    return {
-      ok: false,
-      message: `Locked furniture already conflicts (${lockedCheck.reason ?? 'invalid layout'}). Unlock or move an item in Guided mode.`,
+  const lockedItems = included.filter((id) => current[id].locked).map((id) => current[id])
+  if (lockedItems.length > 0) {
+    const lockedCheck = validateLayout(lockedItems)
+    if (!lockedCheck.ok) {
+      return {
+        ok: false,
+        message: `Locked furniture already conflicts (${lockedCheck.reason ?? 'invalid layout'}). Unlock or move an item in Guided mode.`,
+      }
     }
   }
 
   const rng = createRng(seed)
-  const currentSelected = selected.map((id) => current[id])
-  const currentSignature = layoutSignature(currentSelected)
-  const layouts = buildLayouts(selected, current, rng)
+  const currentScene = ALL_IDS.map((id) => current[id])
+  const currentSignature = layoutSignature(currentScene)
+  const layouts = buildLayouts(included, current, rng)
 
   const unique = new Map<string, PlacedItem[]>()
   for (const layout of layouts) {
-    const signature = layoutSignature(layout)
-    if (!unique.has(signature)) unique.set(signature, layout)
+    const scene = composeScene(current, layout)
+    const generated = scene.filter((item) => included.includes(item.id) && !current[item.id].locked)
+    if (generated.some((item) => !validateItem(item, scene.filter((other) => other.id !== item.id)).ok)) {
+      continue
+    }
+    const signature = layoutSignature(scene)
+    if (!unique.has(signature)) unique.set(signature, scene)
   }
 
-  const fresh = [...unique.entries()].filter(
-    ([signature]) => signature !== currentSignature && !recentSignatures.includes(signature),
-  )
+  const fresh = [...unique.entries()].filter(([signature, scene]) => {
+    if (signature === currentSignature) return false
+    if (recentSignatures.includes(signature)) return false
+    return isMeaningfullyDifferent(currentScene, scene)
+  })
 
   if (fresh.length === 0) {
     return {
       ok: false,
       message:
         unique.size === 0
-          ? 'No valid variant could be found for the current selection and locks.'
-          : 'No further distinct variants are available for the current selection and locks.',
+          ? 'No valid variant could be found for the current inclusion and locks.'
+          : 'No additional distinct valid variant found',
     }
   }
 
@@ -470,25 +631,30 @@ export function generateVariant(
     .map(([signature, layoutItems]) => ({
       signature,
       items: layoutItems,
-      score: scoreLayout(layoutItems, currentSignature, recentSignatures),
+      score: scoreLayout(layoutItems, currentScene, recentSignatures),
     }))
     .sort((a, b) => b.score - a.score || a.signature.localeCompare(b.signature))
 
   const diverse: typeof ranked = []
-  const seenPositions = new Set<string>()
   for (const entry of ranked) {
-    const key = positionKey(entry.items)
-    if (seenPositions.has(key)) continue
-    seenPositions.add(key)
+    if (diverse.some((seen) => !isMeaningfullyDifferent(seen.items, entry.items))) continue
+    const sofa = entry.items.find((item) => item.id === 'sofa')
+    const sofaTooClose = sofa
+      ? diverse.some((seen) => {
+          const other = seen.items.find((item) => item.id === 'sofa')
+          if (!other || !sofa) return false
+          const sameAxis = orientationAxis(sofa.rotation) === orientationAxis(other.rotation)
+          const sameEdge = sofaAnchorEdge(sofa) === sofaAnchorEdge(other)
+          const close = Math.hypot(sofa.x - other.x, sofa.y - other.y) < SOFA_MOVE_MM
+          return close && sameAxis && sameEdge
+        })
+      : false
+    if (sofaTooClose && diverse.length >= 2) continue
     diverse.push(entry)
     if (diverse.length >= TOP_PICKS) break
   }
-  if (diverse.length < 3) {
-    for (const entry of ranked) {
-      if (diverse.includes(entry)) continue
-      diverse.push(entry)
-      if (diverse.length >= TOP_PICKS) break
-    }
+  if (diverse.length === 0) {
+    diverse.push(...ranked.slice(0, TOP_PICKS))
   }
 
   const top = diverse.slice(0, Math.min(TOP_PICKS, diverse.length))

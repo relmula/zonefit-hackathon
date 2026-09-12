@@ -1,15 +1,8 @@
-import {
-  FURNITURE_BY_ID,
-  LOUNGE_ZONE,
-  clearanceOf,
-  footprintOf,
-  type PlacedItem,
-  rectInside,
-  rectsOverlap,
-} from './model'
+import { classifyItem, collisionIssues, type ConstraintIssue } from './constraint'
+import { type PlacedItem } from './model'
 
 export type ValidationIssue = {
-  code: 'outside-zone' | 'overlap' | 'blocks-clearance' | 'in-clearance' | 'no-snap'
+  code: ConstraintIssue['code'] | 'outside-zone'
   reason: string
 }
 
@@ -27,42 +20,18 @@ function result(issues: ValidationIssue[]): ValidationResult {
   }
 }
 
+/** Strict check used by automatic generation: the item must be inside-valid. */
 export function validateItem(
   candidate: PlacedItem,
   others: readonly PlacedItem[],
 ): ValidationResult {
-  const def = FURNITURE_BY_ID[candidate.id]
-  const footprint = footprintOf(candidate, def)
-  const clearance = clearanceOf(candidate, def)
-  const issues: ValidationIssue[] = []
-
-  if (!rectInside(footprint, LOUNGE_ZONE)) {
-    issues.push({ code: 'outside-zone', reason: 'Outside the Lounge Zone' })
+  const unlocked = { ...candidate, locked: false }
+  const assessment = classifyItem(unlocked, others)
+  if (assessment.state === 'inside-valid') return result([])
+  if (assessment.state === 'outside') {
+    return result([{ code: 'outside-zone', reason: 'Outside the Lounge Zone' }])
   }
-
-  for (const other of others) {
-    if (other.id === candidate.id) continue
-    const otherDef = FURNITURE_BY_ID[other.id]
-    const otherFootprint = footprintOf(other, otherDef)
-    const otherClearance = clearanceOf(other, otherDef)
-    const otherName = otherDef.label
-
-    if (rectsOverlap(footprint, otherFootprint)) {
-      issues.push({ code: 'overlap', reason: `Overlaps ${otherName}` })
-      continue
-    }
-    if (rectsOverlap(footprint, otherClearance)) {
-      issues.push({ code: 'blocks-clearance', reason: `Blocks ${otherName} clearance` })
-    }
-    if (rectsOverlap(clearance, otherFootprint)) {
-      issues.push({
-        code: 'in-clearance',
-        reason: `Clearance overlaps ${otherName}`,
-      })
-    }
-  }
-
-  return result(issues)
+  return result(assessment.issues)
 }
 
 export function validateLayout(items: readonly PlacedItem[]): ValidationResult {
@@ -74,6 +43,6 @@ export function validateLayout(items: readonly PlacedItem[]): ValidationResult {
   return result([])
 }
 
-export function nearbySnapReason(): ValidationResult {
-  return result([{ code: 'no-snap', reason: 'No valid snapped position nearby' }])
+export function hasCollision(candidate: PlacedItem, others: readonly PlacedItem[]): boolean {
+  return collisionIssues(candidate, others).length > 0
 }

@@ -5,6 +5,7 @@ import {
   SideTableShape,
   SofaShape,
 } from './FurnitureShapes'
+import { classifyItem, lockDisabledReason, type ConstraintResult } from './constraint'
 import {
   ALL_IDS,
   FURNITURE,
@@ -12,19 +13,16 @@ import {
   LOUNGE_ZONE,
   ROOM_HEIGHT_MM,
   ROOM_WIDTH_MM,
-  clearanceOf,
+  clampItemToRoom,
   createInitialItems,
-  footprintOf,
   formatMmSize,
   mmToPercent,
   nextRotation,
-  rotatedSize,
   type FurnitureId,
   type Mode,
   type PlacedItem,
   type PointMm,
 } from './model'
-import { nearestValidSnap, tryRotateItem } from './snap'
 import { generateVariant } from './variants'
 
 const LABEL_SIDE_PX = 40
@@ -47,8 +45,6 @@ type Preview = {
   id: FurnitureId
   x: number
   y: number
-  valid: boolean
-  reason: string | null
 }
 
 function FurnitureGlyph({ id }: { id: FurnitureId }) {
@@ -73,17 +69,30 @@ function pointerToMm(event: PointerEvent | ReactPointerEvent, room: DOMRect): Po
   }
 }
 
+function othersOf(
+  id: FurnitureId,
+  source: Record<FurnitureId, PlacedItem>,
+): PlacedItem[] {
+  return ALL_IDS.filter((itemId) => itemId !== id).map((itemId) => source[itemId])
+}
+
+function fieldClass(result: ConstraintResult): string {
+  if (result.state === 'inside-valid') return 'bg-valid/35'
+  if (result.state === 'locked') return 'bg-clearance/25'
+  return 'bg-conflict/35'
+}
+
 function App() {
   const stageRef = useRef<HTMLDivElement>(null)
   const roomRef = useRef<HTMLDivElement>(null)
   const dragRef = useRef<DragSession | null>(null)
   const previewRef = useRef<Preview | null>(null)
   const itemsRef = useRef(createInitialItems())
-  const selectedRef = useRef<FurnitureId[]>([...ALL_IDS])
+  const includedRef = useRef<FurnitureId[]>([...ALL_IDS])
 
   const [roomPx, setRoomPx] = useState({ width: 0, height: 0 })
   const [mode, setMode] = useState<Mode>('guided')
-  const [selected, setSelected] = useState<FurnitureId[]>([...ALL_IDS])
+  const [included, setIncluded] = useState<FurnitureId[]>([...ALL_IDS])
   const [items, setItems] = useState(createInitialItems)
   const [activeId, setActiveId] = useState<FurnitureId | null>('sofa')
   const [preview, setPreview] = useState<Preview | null>(null)
@@ -96,8 +105,8 @@ function App() {
 
   useEffect(() => {
     itemsRef.current = items
-    selectedRef.current = selected
-  }, [items, selected])
+    includedRef.current = included
+  }, [items, included])
 
   useLayoutEffect(() => {
     const stage = stageRef.current
@@ -120,29 +129,27 @@ function App() {
     return () => observer.disconnect()
   }, [])
 
-  const othersOf = useCallback(
-    (id: FurnitureId, source = itemsRef.current) =>
-      selectedRef.current.filter((itemId) => itemId !== id).map((itemId) => source[itemId]),
-    [],
-  )
-
   const displayItem = (id: FurnitureId): PlacedItem => {
     const item = items[id]
     if (preview && preview.id === id) return { ...item, x: preview.x, y: preview.y }
     return item
   }
 
-  const toggleSelected = (id: FurnitureId) => {
+  const liveItems = (): Record<FurnitureId, PlacedItem> => {
+    const next = { ...items }
+    if (preview) next[preview.id] = { ...next[preview.id], x: preview.x, y: preview.y }
+    return next
+  }
+
+  const toggleIncluded = (id: FurnitureId) => {
     setAnimate(false)
-    setSelected((current) => {
+    setIncluded((current) => {
       if (current.includes(id)) {
-        const next = current.filter((item) => item !== id)
         setItems((itemsNow) => ({
           ...itemsNow,
           [id]: { ...itemsNow[id], locked: false },
         }))
-        if (activeId === id) setActiveId(next[0] ?? null)
-        return next
+        return current.filter((item) => item !== id)
       }
       return [...current, id]
     })
@@ -159,33 +166,30 @@ function App() {
   const handleRotate = useCallback(() => {
     if (!activeId) return
     const item = itemsRef.current[activeId]
-    if (item.locked || !selectedRef.current.includes(activeId)) return
-    const attempt = tryRotateItem(item, othersOf(activeId), nextRotation(item.rotation))
-    if (!attempt.validation.ok) {
-      setStatus({
-        kind: 'error',
-        message: attempt.validation.reason ?? 'Rotation is not valid here',
-      })
-      return
-    }
+    if (item.locked) return
     setAnimate(false)
-    commitItem(activeId, {
-      x: attempt.x,
-      y: attempt.y,
-      rotation: nextRotation(item.rotation),
-    })
+    const rotated = clampItemToRoom({ ...item, rotation: nextRotation(item.rotation) })
+    commitItem(activeId, { x: rotated.x, y: rotated.y, rotation: rotated.rotation })
     setStatus(null)
-  }, [activeId, othersOf])
+  }, [activeId])
 
   const handleLockToggle = () => {
-    if (!activeId || !selected.includes(activeId)) return
-    commitItem(activeId, { locked: !items[activeId].locked })
+    if (!activeId) return
+    const item = items[activeId]
+    if (item.locked) {
+      commitItem(activeId, { locked: false })
+      setStatus(null)
+      return
+    }
+    const result = classifyItem(item, othersOf(activeId, items))
+    if (!result.canLock) return
+    commitItem(activeId, { locked: true })
     setStatus(null)
   }
 
   const handleGenerate = () => {
     setAnimate(true)
-    const result = generateVariant(selected, items, recentSignatures, variantSeed)
+    const result = generateVariant(included, items, recentSignatures, variantSeed)
     setVariantSeed((value) => value + 1)
     if (!result.ok) {
       setStatus({ kind: 'error', message: result.message })
@@ -203,14 +207,15 @@ function App() {
     setVariantIndex(nextIndex)
     setStatus({
       kind: 'success',
-      message: `Variant ${nextIndex}: ${result.items.length} items placed successfully`,
+      message: `Variant ${nextIndex}: ${included.length} items placed successfully`,
     })
   }
 
   const handleReset = () => {
     dragRef.current = null
+    previewRef.current = null
     setItems(createInitialItems())
-    setSelected([...ALL_IDS])
+    setIncluded([...ALL_IDS])
     setActiveId('sofa')
     setPreview(null)
     setDraggingId(null)
@@ -227,7 +232,7 @@ function App() {
     event.preventDefault()
     setActiveId(id)
     setStatus(null)
-    if (mode !== 'guided' || items[id].locked) return
+    if (items[id].locked) return
     const room = roomRef.current?.getBoundingClientRect()
     if (!room) return
     const mm = pointerToMm(event, room)
@@ -248,29 +253,18 @@ function App() {
     const room = roomRef.current?.getBoundingClientRect()
     if (!room) return
     const mm = pointerToMm(event, room)
-    const dx = mm.x - (drag.origin.x + drag.grab.x)
-    const dy = mm.y - (drag.origin.y + drag.grab.y)
-    if (!drag.moved && Math.hypot(dx, dy) < 40) return
+    const desired = { x: mm.x - drag.grab.x, y: mm.y - drag.grab.y }
+    const dx = desired.x - drag.origin.x
+    const dy = desired.y - drag.origin.y
+    if (!drag.moved && Math.hypot(dx, dy) < 12) return
     drag.moved = true
     setAnimate(false)
     setDraggingId(drag.id)
-    const desired = { x: mm.x - drag.grab.x, y: mm.y - drag.grab.y }
     const item = itemsRef.current[drag.id]
-    const snap = nearestValidSnap(desired, item, othersOf(drag.id))
-    const nextPreview: Preview = {
-      id: drag.id,
-      x: snap.x,
-      y: snap.y,
-      valid: snap.validation.ok,
-      reason: snap.validation.reason,
-    }
+    const clamped = clampItemToRoom({ ...item, x: desired.x, y: desired.y })
+    const nextPreview: Preview = { id: drag.id, x: clamped.x, y: clamped.y }
     previewRef.current = nextPreview
     setPreview(nextPreview)
-    if (!snap.validation.ok && snap.validation.reason) {
-      setStatus({ kind: 'error', message: snap.validation.reason })
-    } else {
-      setStatus(null)
-    }
   }
 
   const onPointerUp = (event: ReactPointerEvent<HTMLDivElement>) => {
@@ -280,14 +274,8 @@ function App() {
       event.currentTarget.releasePointerCapture(drag.pointerId)
     }
     const currentPreview = previewRef.current
-    if (drag.moved && currentPreview && currentPreview.id === drag.id && currentPreview.valid) {
+    if (drag.moved && currentPreview && currentPreview.id === drag.id) {
       commitItem(drag.id, { x: currentPreview.x, y: currentPreview.y })
-      setStatus(null)
-    } else if (drag.moved && currentPreview && !currentPreview.valid) {
-      setStatus({
-        kind: 'error',
-        message: currentPreview.reason ?? 'No valid snapped position nearby',
-      })
     }
     dragRef.current = null
     previewRef.current = null
@@ -306,8 +294,10 @@ function App() {
     return () => window.removeEventListener('keydown', onKey)
   }, [handleRotate])
 
-  const active = activeId && selected.includes(activeId) ? items[activeId] : null
-  const previewValid = preview?.valid
+  const source = liveItems()
+  const active = activeId ? displayItem(activeId) : null
+  const activeResult = active ? classifyItem(active, othersOf(active.id, source)) : null
+  const lockReason = activeResult ? lockDisabledReason(activeResult) : null
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-paper text-ink">
@@ -390,80 +380,63 @@ function App() {
                       </span>
                     </div>
 
-                    {selected.map((id) => {
+                    {ALL_IDS.map((id) => {
                       const item = displayItem(id)
                       const def = FURNITURE_BY_ID[id]
-                      const footprint = footprintOf(item)
-                      const clearance = clearanceOf(item)
+                      const result = classifyItem(item, othersOf(id, source))
                       const isActive = activeId === id
-                      const showClearance = isActive || draggingId === id
-                      const aabb = rotatedSize(def, item.rotation)
                       const moving = draggingId === id
-                      const outline = moving
-                        ? previewValid
-                          ? 'outline-2 outline-valid'
-                          : 'outline-2 outline-conflict'
-                        : isActive
-                          ? 'outline-2 outline-accent'
-                          : 'outline outline-1 outline-transparent'
+                      const showField =
+                        (isActive || moving) &&
+                        result.state !== 'outside' &&
+                        (result.state !== 'locked' || isActive)
+                      const outline = isActive ? 'outline-2 outline-accent' : 'outline outline-1 outline-transparent'
 
                       return (
                         <div key={id}>
-                          {showClearance && (
+                          {showField && (
                             <div
-                              className={`pointer-events-none absolute rounded-[12px] ${
-                                moving && !previewValid
-                                  ? 'bg-conflict/25'
-                                  : moving
-                                    ? 'bg-valid/25'
-                                    : 'bg-clearance/25'
-                              }`}
+                              className={`pointer-events-none absolute rounded-[18px] ${fieldClass(result)}`}
                               style={{
-                                left: mmToPercent(clearance.x, ROOM_WIDTH_MM),
-                                top: mmToPercent(clearance.y, ROOM_HEIGHT_MM),
-                                width: mmToPercent(clearance.w, ROOM_WIDTH_MM),
-                                height: mmToPercent(clearance.h, ROOM_HEIGHT_MM),
-                                transition: moving || !animate ? 'none' : 'left 280ms ease, top 280ms ease',
+                                left: mmToPercent(item.x - (def.w / 2 + def.clearance), ROOM_WIDTH_MM),
+                                top: mmToPercent(item.y - (def.h / 2 + def.clearance), ROOM_HEIGHT_MM),
+                                width: mmToPercent(def.w + def.clearance * 2, ROOM_WIDTH_MM),
+                                height: mmToPercent(def.h + def.clearance * 2, ROOM_HEIGHT_MM),
+                                transform: `rotate(${item.rotation}deg)`,
+                                transformOrigin: 'center center',
+                                transition: moving || !animate ? 'none' : 'left 280ms ease, top 280ms ease, transform 280ms ease',
                               }}
                             />
                           )}
                           <div
                             className={`absolute z-[1] touch-none ${outline} ${
-                              items[id].locked || mode !== 'guided' ? 'cursor-pointer' : 'cursor-grab'
+                              items[id].locked ? 'cursor-pointer' : 'cursor-grab'
                             } ${moving ? 'cursor-grabbing' : ''}`}
                             role="button"
                             tabIndex={0}
                             aria-label={`${def.label}${items[id].locked ? ', locked' : ''}`}
                             aria-pressed={isActive}
                             style={{
-                              left: mmToPercent(footprint.x, ROOM_WIDTH_MM),
-                              top: mmToPercent(footprint.y, ROOM_HEIGHT_MM),
-                              width: mmToPercent(footprint.w, ROOM_WIDTH_MM),
-                              height: mmToPercent(footprint.h, ROOM_HEIGHT_MM),
-                              transition: moving || !animate ? 'none' : 'left 280ms ease, top 280ms ease',
+                              left: mmToPercent(item.x - def.w / 2, ROOM_WIDTH_MM),
+                              top: mmToPercent(item.y - def.h / 2, ROOM_HEIGHT_MM),
+                              width: mmToPercent(def.w, ROOM_WIDTH_MM),
+                              height: mmToPercent(def.h, ROOM_HEIGHT_MM),
+                              transform: `rotate(${item.rotation}deg)`,
+                              transformOrigin: 'center center',
+                              zIndex: moving || isActive ? 3 : 1,
+                              transition: moving || !animate ? 'none' : 'left 280ms ease, top 280ms ease, transform 280ms ease',
                             }}
                             onPointerDown={(event) => onPointerDown(event, id)}
                             onPointerMove={onPointerMove}
                             onPointerUp={onPointerUp}
                             onPointerCancel={onPointerUp}
                           >
-                            <div
-                              className="absolute"
-                              style={{
-                                left: '50%',
-                                top: '50%',
-                                width: `${(def.w / aabb.w) * 100}%`,
-                                height: `${(def.h / aabb.h) * 100}%`,
-                                transform: `translate(-50%, -50%) rotate(${item.rotation}deg)`,
-                              }}
-                            >
-                              <CanvasShape id={id} />
-                            </div>
+                            <CanvasShape id={id} />
                             <span className="pointer-events-none absolute inset-x-1 bottom-1 text-center text-[10px] leading-tight font-medium text-ink/70">
                               {def.label}
                             </span>
                             {items[id].locked && (
-                              <span className="pointer-events-none absolute top-1 right-1 rounded-[6px] bg-walnut px-1.5 py-0.5 text-[9px] font-medium tracking-[0.04em] text-panel uppercase">
+                              <span className="pointer-events-none absolute top-1 right-1 rounded-[6px] bg-walnut/90 px-1.5 py-0.5 text-[9px] font-medium tracking-[0.04em] text-panel uppercase">
                                 Lock
                               </span>
                             )}
@@ -512,12 +485,12 @@ function App() {
 
           <h2 className="text-[11px] font-medium tracking-[0.08em] text-muted uppercase">Furniture</h2>
           <p className="mt-1 mb-3 text-[12px] text-muted">
-            All pieces start selected. Click a card to include or exclude it.
+            Cards choose which pieces take part in automatic variants. All objects stay visible.
           </p>
 
           <ul className="flex flex-col gap-2">
             {FURNITURE.map((item) => {
-              const isOn = selected.includes(item.id)
+              const isOn = included.includes(item.id)
               const isActive = activeId === item.id
               const locked = items[item.id].locked
               return (
@@ -525,29 +498,29 @@ function App() {
                   <button
                     type="button"
                     aria-pressed={isOn}
-                    onClick={() => toggleSelected(item.id)}
+                    onClick={() => toggleIncluded(item.id)}
                     className={`flex w-full items-center gap-2.5 rounded-[12px] border px-2.5 py-2 text-left ${
                       isOn
                         ? `border-line bg-panel shadow-[inset_3px_0_0_0_#c4a574] ${isActive ? 'border-accent' : ''}`
-                        : 'border-transparent bg-stone/60 opacity-75'
+                        : 'border-transparent bg-stone/60'
                     }`}
                   >
-                    <div className={`h-9 w-11 shrink-0 ${isOn ? '' : 'opacity-60'}`}>
+                    <div className="h-9 w-11 shrink-0">
                       <FurnitureGlyph id={item.id} />
                     </div>
                     <div className="min-w-0 flex-1">
                       <p className="text-[13px] font-medium">
                         {item.label}
-                        {locked && isOn ? ' · Locked' : ''}
+                        {locked ? ' · Locked' : ''}
                       </p>
                       <p className="text-[11px] text-muted">{formatMmSize(item)}</p>
                     </div>
                     <span
-                      className={`rounded-[6px] px-2 py-0.5 text-[10px] font-medium ${
+                      className={`rounded-[6px] px-2 py-0.5 text-[10px] font-medium tracking-[0.04em] ${
                         isOn ? 'bg-accent text-panel' : 'bg-stone text-muted'
                       }`}
                     >
-                      {isOn ? 'On' : 'Off'}
+                      {isOn ? 'IN VARIANT' : 'EXCLUDED'}
                     </span>
                   </button>
                 </li>
@@ -555,28 +528,48 @@ function App() {
             })}
           </ul>
 
-          {active && (
+          {active && activeResult && (
             <div className="relative mt-4 rounded-[14px] border border-line bg-stone/40 px-3 py-3 shadow-[inset_0_1px_0_rgba(255,248,236,0.7)]">
               <p className="text-[11px] font-medium tracking-[0.08em] text-muted uppercase">Active</p>
               <p className="mt-1 font-serif text-[16px] font-medium">{FURNITURE_BY_ID[active.id].label}</p>
               <p className="text-[12px] text-muted">Angle {active.rotation}°</p>
+              <p
+                className={`mt-1.5 text-[12px] font-medium ${
+                  activeResult.state === 'inside-valid'
+                    ? 'text-valid'
+                    : activeResult.state === 'outside' || activeResult.state === 'locked'
+                      ? 'text-muted'
+                      : 'text-conflict'
+                }`}
+              >
+                {activeResult.reason}
+              </p>
+              {activeResult.state === 'locked' && (
+                <p className="mt-1 text-[12px] text-muted">Unlock to transform this item</p>
+              )}
               <div className="mt-2.5 flex gap-2">
                 <button
                   type="button"
                   onClick={handleRotate}
                   disabled={active.locked}
+                  title={active.locked ? 'Unlock to transform this item' : 'Rotate 45° clockwise'}
                   className="flex-1 rounded-[10px] border border-line bg-panel px-2 py-1.5 text-[12px] font-medium disabled:opacity-40"
                 >
-                  Rotate 90°
+                  Rotate 45°
                 </button>
                 <button
                   type="button"
                   onClick={handleLockToggle}
-                  className="flex-1 rounded-[10px] border border-line bg-panel px-2 py-1.5 text-[12px] font-medium"
+                  disabled={!active.locked && !activeResult.canLock}
+                  title={!active.locked && lockReason ? lockReason : undefined}
+                  className="flex-1 rounded-[10px] border border-line bg-panel px-2 py-1.5 text-[12px] font-medium disabled:opacity-40"
                 >
-                  {active.locked ? 'Unlock' : 'Lock'}
+                  {active.locked ? 'Unlock Position' : 'Lock Position'}
                 </button>
               </div>
+              {!active.locked && lockReason && lockReason !== activeResult.reason && (
+                <p className="mt-1.5 text-[11px] text-muted">{lockReason}</p>
+              )}
             </div>
           )}
 
@@ -592,7 +585,7 @@ function App() {
 
           {mode === 'guided' && (
             <p className="mt-4 text-[12px] text-muted">
-              Drag to a valid 300 mm grid cell. Use Rotate 90° or R. Locked pieces stay put.
+              Drag freely in the room. Constraints apply inside the Lounge Zone. Rotate 45° or press R.
             </p>
           )}
 
